@@ -1,11 +1,21 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.DS_Store
+
+# --- SECRETS: never commit these ---
 .env
+.env.*
+!.env.example
+*service-account*.json
+*credentials*.json
+*-key.json
+gcloud-key.json
+# ------------------------------------
+
 data/output/*
 !data/output/.gitkeep
 data/sample_images/*
 !data/sample_images/.gitkeep
 !data/sample_images/README.md
-*.egg-info/
-.DS_Store
