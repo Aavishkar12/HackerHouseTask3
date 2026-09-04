@@ -7,7 +7,8 @@ This repo is built in stages. This README will grow as each stage lands.
 
 ## Status
 
-- [x] **Stage 1 — Face detection & encoding** (this stage)
+- [x] **Stage 1 — Face detection & encoding** (this stage) — verified
+      end-to-end against a real photo, 9/9 checks passing
 - [ ] Stage 2 — Web/social media search for a matching post
 - [ ] Stage 3 — Blockchain upload + re-verification
 
@@ -28,7 +29,8 @@ hh-goa-2026-pipeline/
 │       ├── __init__.py
 │       └── face_encode.py    # reusable, importable encoding functions
 ├── scripts/
-│   └── demo_encode.py        # CLI demo: encode a sample photo, save the result
+│   ├── demo_encode.py        # CLI demo: encode a sample photo, save the result
+│   └── verify_stage1.py      # full self-check (detection, determinism, error paths)
 ├── tests/
 │   └── test_face_encode.py   # automated tests for error handling
 └── data/
@@ -95,6 +97,45 @@ Expected output on success:
 
 The saved JSON file is what Stage 2 (web search) will eventually load
 via `faceid.face_encode.load_encoding(...)`.
+
+### Verify the whole stage
+
+`demo_encode.py` just proves it runs. To prove it actually *works*:
+
+```bash
+python scripts/verify_stage1.py
+```
+
+This runs 9 checks — detection + bounding box (saved as an annotated
+image you can eyeball), encoding shape/dtype, determinism, JSON
+round-trip, robustness to downscaling/re-compression, and all three
+error paths. Verified output on a real test photo:
+
+```
+1) Detection
+  [PASS] exactly one face found — 1 face(s)
+       bbox (top,right,bottom,left) = (759, 605, 1221, 142) -> 463x462px
+2) Encoding
+  [PASS] shape (128,) float64
+       norm=1.3703 min=-0.3127 max=0.3744 mean=-0.0028
+3) Determinism
+  [PASS] re-encoding gives distance ~0 — distance=0.000000000
+4) Persistence
+  [PASS] JSON round-trip lossless
+5) Robustness (same person, degraded image)
+  [PASS] 3x downscaled + recompressed still matches — distance=0.0900 (tolerance 0.6)
+6) Error handling — multiple faces
+  [PASS] raises MultipleFacesDetectedError — num_faces=2
+  [PASS] allow_multiple=True returns both — 2 encodings
+7) Error handling — no face
+  [PASS] raises NoFaceDetectedError
+8) Error handling — missing file
+  [PASS] raises FileNotFoundError
+
+  Stage 1 verification: 9/9 checks passed
+```
+
+Encoding a single photo takes ~4s on CPU with the `hog` model.
 
 ### Error handling
 
