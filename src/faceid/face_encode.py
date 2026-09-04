@@ -1,75 +1,106 @@
 """
 face_encode.py — Task 1 of the HH Goa 2026 pipeline: face detection & encoding.
 
-Reusable, importable functions for turning a photo into a 128-dimensional
-face encoding using the `face_recognition` library (dlib's ResNet-based
-face recognition model under the hood).
+Reusable, importable functions for turning a photo into a face embedding
+using **DeepFace with the ArcFace model** (RetinaFace for detection).
 
 Later pipeline stages (web/social search, blockchain verification) import
-`encode_face_from_path` (or `encode_face_from_array`) from this module
-rather than re-implementing detection/encoding.
+`encode_face_from_path` / `FaceGallery` from this module rather than
+re-implementing detection or matching.
+
+Why ArcFace (and not dlib/face_recognition)
+-------------------------------------------
+Both were benchmarked on the same 7 real photos (6 of one person across
+varied lighting/pose/glasses, plus 1 impostor), leave-one-out:
+
+    backend                separation ratio   normalised margin
+    dlib/face_recognition       1.263               0.208
+    DeepFace Facenet512         1.334               0.250
+    DeepFace ArcFace            1.423               0.297   <- chosen
+
+ArcFace gave ~43% more headroom between the worst true match and the
+impostor, and was the only backend where matching still separated
+correctly *without* a gallery. Speed was comparable (~3.7s vs ~4.0s per
+image on CPU). ArcFace is also trained on more demographically diverse
+data than dlib's model, which matters here — the false positive that
+prompted this comparison was between two South Asian men.
+
+Distance metric
+---------------
+ArcFace embeddings are compared with **cosine distance** (0 = identical
+direction, 1 = orthogonal, 2 = opposite). This is NOT the Euclidean
+distance dlib used, so thresholds from face_recognition tutorials do not
+transfer. See DEFAULT_TOLERANCE.
 
 Typical usage
 -------------
     from faceid.face_encode import encode_face_from_path
 
-    encoding = encode_face_from_path("data/sample_images/me.jpg")
-    # encoding is a numpy.ndarray of shape (128,), dtype float64
+    embedding = encode_face_from_path("data/sample_images/me.jpg")
+    # numpy.ndarray of shape (512,), dtype float64
 
 Error handling
 --------------
-Two things can go wrong with a real-world photo and both are treated as
-first-class, catchable errors rather than crashes:
+  * No face found            -> NoFaceDetectedError
+  * More than one face found -> MultipleFacesDetectedError
+    (unless allow_multiple=True)
 
-  * No face found at all               -> NoFaceDetectedError
-  * More than one face found           -> MultipleFacesDetectedError
-    (unless `allow_multiple=True`, in which case all encodings are
-    returned instead of raising)
-
-Both errors subclass FaceEncodingError, so callers that don't care about
-the distinction can just catch that.
+Both subclass FaceEncodingError.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
 
+# Quieten TensorFlow's startup noise before DeepFace imports it.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+warnings.filterwarnings("ignore", category=UserWarning)
+
 try:
-    import face_recognition
+    from deepface import DeepFace
 except ImportError as exc:  # pragma: no cover - import-time guidance
     raise ImportError(
-        "The 'face_recognition' package (and its dlib dependency) is not "
-        "installed in this environment. Run:\n"
+        "The 'deepface' package is not installed in this environment. Run:\n"
         "    pip install -r requirements.txt\n"
-        "See README.md for platform-specific dlib build notes "
-        "(cmake / a C++ compiler are required)."
+        "Note: DeepFace pulls in TensorFlow and downloads ~335MB of model "
+        "weights to ~/.deepface on first use. See README.md."
     ) from exc
 
 
 PathLike = Union[str, Path]
 
-# "hog" is CPU-only and fast (good default for a laptop / this prototype).
-# "cnn" is far more accurate but needs a GPU (or is very slow on CPU).
-DEFAULT_MODEL = "hog"
+# ArcFace: 512-d embeddings, strong accuracy, good demographic robustness.
+DEFAULT_MODEL = "ArcFace"
 
-# face_recognition's own documented default is 0.6, but that is measurably
-# too loose for this pipeline. Measured on our own test data:
+# RetinaFace is the most accurate detector DeepFace ships. "opencv" is much
+# faster but misses angled/small faces; "mtcnn" sits in between.
+DEFAULT_DETECTOR = "retinaface"
+
+# Embedding dimensionality for DEFAULT_MODEL (sanity-check value).
+EMBEDDING_DIM = 512
+
+# DeepFace's own calibrated threshold for ArcFace + cosine is 0.68.
+# We use 0.65 — slightly stricter — based on our own measurements:
 #
-#   same person, same photo downscaled 3x + recompressed .... 0.09
-#   same person, different photo/pose/lighting/camera ........ 0.41
-#   DIFFERENT people (two friends in one group photo) ........ 0.58
+#   worst true match (same person, harsh sunlight photo) .... 0.5384
+#   impostor (different person) ............................. 0.7662
 #
-# At 0.6 the different person is a false positive; at 0.5 the real match
-# still passes with room to spare and the impostor is correctly rejected.
-# Stage 2 will be comparing against faces found on the open web, where a
-# false positive means claiming a stranger's post belongs to you — so we
-# bias toward strictness. Override per-call if you need to.
-DEFAULT_TOLERANCE = 0.5
+# 0.65 sits near the midpoint, leaving ~0.11 headroom on both sides.
+# We bias strict deliberately: in Stage 2 a false positive means claiming
+# a STRANGER's social media post belongs to the user, and Stage 3 then
+# writes that claim to a blockchain permanently. Missing a real match is
+# recoverable; a wrong match written on-chain is not.
+DEFAULT_TOLERANCE = 0.65
+
+# DeepFace's library default, for reference / override.
+DEEPFACE_DEFAULT_TOLERANCE = 0.68
 
 
 class FaceEncodingError(Exception):
@@ -82,8 +113,8 @@ class NoFaceDetectedError(FaceEncodingError):
     def __init__(self, image_path: PathLike):
         super().__init__(
             f"No face detected in '{image_path}'. Make sure the photo "
-            "clearly shows a front-facing face, is well lit, and isn't "
-            "too low-resolution or heavily cropped."
+            "clearly shows a face, is well lit, and isn't too "
+            "low-resolution or heavily cropped."
         )
         self.image_path = str(image_path)
 
@@ -96,7 +127,7 @@ class MultipleFacesDetectedError(FaceEncodingError):
             f"Found {num_faces} faces in '{image_path}', expected exactly "
             "one. Crop the photo to a single person, or call "
             "encode_face_from_path(..., allow_multiple=True) if you "
-            "intentionally want encodings for every face in the image."
+            "intentionally want embeddings for every face in the image."
         )
         self.image_path = str(image_path)
         self.num_faces = num_faces
@@ -104,124 +135,135 @@ class MultipleFacesDetectedError(FaceEncodingError):
 
 @dataclass
 class FaceMatch:
-    """One detected face: its encoding plus where it was found in the image."""
+    """One detected face: its embedding plus where it was found."""
 
-    encoding: np.ndarray  # shape (128,), dtype float64
+    encoding: np.ndarray  # shape (512,), dtype float64
     location: tuple  # (top, right, bottom, left) in pixels
+    confidence: float = 0.0  # detector confidence, 0-1
 
 
-def _load_image(image_path: PathLike) -> np.ndarray:
-    image_path = Path(image_path)
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image file not found: '{image_path}'")
-    # face_recognition.load_image_file returns an RGB numpy array and
-    # raises its own error for unreadable / corrupt files.
-    return face_recognition.load_image_file(str(image_path))
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Cosine distance between two embeddings: 0 = identical direction.
+
+    This is the metric ArcFace embeddings are calibrated for. Euclidean
+    distance on raw (un-normalised) ArcFace vectors is NOT equivalent and
+    should not be substituted.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0.0 or nb == 0.0:
+        # A zero vector has no direction; treat as maximally dissimilar
+        # rather than raising a divide-by-zero.
+        return float("inf")
+    return float(1.0 - np.dot(a, b) / (na * nb))
+
+
+def _area_to_location(area: dict) -> tuple:
+    """DeepFace gives {x,y,w,h}; convert to (top, right, bottom, left)."""
+    x, y, w, h = area["x"], area["y"], area["w"], area["h"]
+    return (y, x + w, y + h, x)
 
 
 def detect_faces(
     image_path: PathLike,
-    model: str = DEFAULT_MODEL,
-    upsample: int = 1,
-    num_jitters: int = 1,
+    model_name: str = DEFAULT_MODEL,
+    detector_backend: str = DEFAULT_DETECTOR,
 ) -> List[FaceMatch]:
     """
-    Detect every face in an image and return an encoding + location for each.
+    Detect every face in an image and return an embedding + location for each.
 
-    This is the low-level building block. Most callers should use
-    `encode_face_from_path` instead, which adds the "exactly one face"
-    validation that later pipeline stages rely on.
+    Low-level building block. Most callers should use
+    `encode_face_from_path`, which adds the "exactly one face" validation
+    that later pipeline stages rely on.
 
-    Args:
-        image_path: path to a JPEG/PNG (or anything Pillow can read).
-        model: "hog" (fast, CPU) or "cnn" (accurate, needs GPU / is slow).
-        upsample: how many times to upsample the image before detecting —
-            increase (e.g. to 2) to find small/far-away faces, at the
-            cost of speed.
-        num_jitters: how many times to re-sample the face when computing
-            the encoding — higher is more accurate but slower.
-
-    Returns:
-        A list of FaceMatch (possibly empty if no faces were found).
+    Returns an empty list if no face is found (it does NOT raise) — that
+    lets callers decide how to handle it.
     """
-    image = _load_image(image_path)
-    locations = face_recognition.face_locations(
-        image, number_of_times_to_upsample=upsample, model=model
-    )
-    encodings = face_recognition.face_encodings(
-        image, known_face_locations=locations, num_jitters=num_jitters
-    )
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image file not found: '{image_path}'")
+
+    try:
+        reps = DeepFace.represent(
+            img_path=str(image_path),
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=True,
+        )
+    except ValueError as e:
+        # DeepFace signals "no face" by raising ValueError with a message
+        # about face detection. Anything else is a real error.
+        if "face could not be detected" in str(e).lower() or "detected" in str(e).lower():
+            return []
+        raise
+
     return [
-        FaceMatch(encoding=enc, location=loc)
-        for enc, loc in zip(encodings, locations)
+        FaceMatch(
+            encoding=np.asarray(r["embedding"], dtype=np.float64),
+            location=_area_to_location(r["facial_area"]),
+            confidence=float(r.get("face_confidence", 0.0)),
+        )
+        for r in reps
     ]
 
 
 def encode_face_from_path(
     image_path: PathLike,
-    model: str = DEFAULT_MODEL,
-    upsample: int = 1,
-    num_jitters: int = 1,
+    model_name: str = DEFAULT_MODEL,
+    detector_backend: str = DEFAULT_DETECTOR,
     allow_multiple: bool = False,
 ) -> Union[np.ndarray, List[np.ndarray]]:
     """
-    The main entry point: encode the single face in an image.
+    Main entry point: encode the single face in an image.
 
-    Args:
-        image_path: path to the input photo.
-        model: "hog" (default, fast/CPU) or "cnn" (slow/GPU, more accurate).
-        upsample: see `detect_faces`.
-        num_jitters: see `detect_faces`.
-        allow_multiple: if False (default), raises MultipleFacesDetectedError
-            when more than one face is found. If True, returns a list of
-            encodings (one per face) instead of a single array.
-
-    Returns:
-        A single numpy array of shape (128,) when exactly one face is
-        found. If allow_multiple=True, returns a list of such arrays
-        (one per detected face, in the order face_recognition found them).
+    Returns a numpy array of shape (512,) when exactly one face is found.
+    With allow_multiple=True, returns a list of such arrays instead.
 
     Raises:
-        FileNotFoundError: image_path does not exist.
-        NoFaceDetectedError: zero faces found.
-        MultipleFacesDetectedError: more than one face found and
-            allow_multiple=False.
+        FileNotFoundError, NoFaceDetectedError, MultipleFacesDetectedError
     """
     matches = detect_faces(
-        image_path, model=model, upsample=upsample, num_jitters=num_jitters
+        image_path, model_name=model_name, detector_backend=detector_backend
     )
 
     if len(matches) == 0:
         raise NoFaceDetectedError(image_path)
-
     if len(matches) > 1 and not allow_multiple:
         raise MultipleFacesDetectedError(image_path, len(matches))
 
     if allow_multiple:
         return [m.encoding for m in matches]
-
     return matches[0].encoding
 
 
 def encode_face_from_array(
     image: np.ndarray,
-    model: str = DEFAULT_MODEL,
-    upsample: int = 1,
-    num_jitters: int = 1,
+    model_name: str = DEFAULT_MODEL,
+    detector_backend: str = DEFAULT_DETECTOR,
     allow_multiple: bool = False,
 ) -> Union[np.ndarray, List[np.ndarray]]:
     """
-    Same as encode_face_from_path, but takes an already-loaded RGB image
-    array (e.g. a frame grabbed from a webcam or downloaded from the web)
-    instead of a file path. Useful for later stages that fetch images
-    over the network rather than reading them from disk.
+    Same as encode_face_from_path but takes an already-loaded image array
+    (e.g. a frame from a webcam, or an image downloaded from a search
+    result). Stage 2 uses this to avoid writing scraped images to disk.
+
+    `image` should be an RGB or BGR numpy array.
     """
-    locations = face_recognition.face_locations(
-        image, number_of_times_to_upsample=upsample, model=model
-    )
-    encodings = face_recognition.face_encodings(
-        image, known_face_locations=locations, num_jitters=num_jitters
-    )
+    try:
+        reps = DeepFace.represent(
+            img_path=image,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            enforce_detection=True,
+        )
+    except ValueError as e:
+        if "detected" in str(e).lower():
+            raise NoFaceDetectedError("<in-memory image>") from e
+        raise
+
+    encodings = [np.asarray(r["embedding"], dtype=np.float64) for r in reps]
 
     if len(encodings) == 0:
         raise NoFaceDetectedError("<in-memory image>")
@@ -239,16 +281,12 @@ def compare_encodings(
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> tuple[bool, float]:
     """
-    Compare two face encodings.
+    Compare two face embeddings using cosine distance.
 
     Returns (is_match, distance). Lower distance = more similar.
-
-    See DEFAULT_TOLERANCE above for why this project uses 0.5 rather
-    than face_recognition's documented 0.6 default.
+    See DEFAULT_TOLERANCE for why this project uses 0.65.
     """
-    distance = float(
-        np.linalg.norm(np.asarray(known_encoding) - np.asarray(candidate_encoding))
-    )
+    distance = cosine_distance(known_encoding, candidate_encoding)
     return distance <= tolerance, distance
 
 
@@ -258,27 +296,21 @@ def find_best_match(
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> tuple[Optional[int], float, bool]:
     """
-    Given one reference encoding and several candidate encodings (e.g.
-    every face found in a group photo, or in an image scraped from a
-    search result), return the SINGLE closest candidate.
+    Given one reference embedding and several candidates (e.g. every face
+    in a group photo, or in an image from a search result), return the
+    SINGLE closest candidate.
 
-    This is what Stage 2 should use rather than "every face under the
-    threshold": in a group photo more than one face can sit under the
-    tolerance, and picking all of them would mean claiming a stranger's
-    post belongs to you.
+    Stage 2 must use this rather than "every face under the threshold":
+    in a group photo more than one face can sit under the tolerance, and
+    accepting all of them would mean claiming a stranger's post.
 
-    Returns:
-        (index_of_closest, distance, is_match)
-        index is None if `candidates` was empty. `is_match` is False
-        when even the closest candidate is beyond `tolerance`.
+    Returns (index_of_closest, distance, is_match). index is None if
+    `candidates` was empty.
     """
     if len(candidates) == 0:
         return None, float("inf"), False
 
-    distances = [
-        float(np.linalg.norm(np.asarray(known_encoding) - np.asarray(c)))
-        for c in candidates
-    ]
+    distances = [cosine_distance(known_encoding, c) for c in candidates]
     best_idx = int(np.argmin(distances))
     best_distance = distances[best_idx]
     return best_idx, best_distance, best_distance <= tolerance
@@ -287,21 +319,18 @@ def find_best_match(
 @dataclass
 class FaceGallery:
     """
-    Several reference encodings for ONE person.
+    Several reference embeddings for ONE person.
 
-    A single reference photo is not enough. Measured on 6 photos of the
-    same person plus 1 impostor:
+    Even with ArcFace, a gallery materially improves matching. Measured
+    leave-one-out on 6 photos of one person + 1 impostor (cosine):
 
-        single reference  -> same-person distances spanned 0.297-0.602,
-                             impostor distances 0.562-0.707. Those
-                             OVERLAP by 0.040, so no threshold can be
-                             both safe and correct.
-        gallery (min over 6 refs, leave-one-out)
-                          -> every true photo landed <= 0.445,
-                             impostor at 0.562. Margin 0.117 — about 3x
-                             wider, and cleanly separable.
+        single reference : same-person up to 0.7435, impostor 0.7662
+                           -> separable, but only just (0.023 apart)
+        gallery (min)    : same-person up to 0.5384, impostor 0.7662
+                           -> margin 0.2278, ~10x wider
 
-    So Stage 2 should always match against a gallery, not one photo.
+    The candidate only has to resemble the person in ONE reference photo,
+    which is what makes it robust to lighting and pose.
     """
 
     labels: List[str]
@@ -314,12 +343,10 @@ class FaceGallery:
         self, candidate: np.ndarray, tolerance: float = DEFAULT_TOLERANCE
     ) -> tuple[bool, float, Optional[str]]:
         """
-        Compare a candidate face against every reference in the gallery.
+        Compare a candidate face against every reference in the gallery,
+        using the MINIMUM distance.
 
         Returns (is_match, best_distance, label_of_closest_reference).
-        Uses the MINIMUM distance across references: the candidate only
-        has to look like the person in *one* of their reference photos,
-        which is what makes the gallery robust to lighting/pose/angle.
         """
         if not self.encodings:
             return False, float("inf"), None
@@ -330,6 +357,9 @@ class FaceGallery:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "model": DEFAULT_MODEL,
+            "metric": "cosine",
+            "dim": EMBEDDING_DIM,
             "labels": self.labels,
             "encodings": [np.asarray(e).tolist() for e in self.encodings],
         }
@@ -338,6 +368,14 @@ class FaceGallery:
     @classmethod
     def load(cls, in_path: PathLike) -> "FaceGallery":
         data = json.loads(Path(in_path).read_text())
+        stored_model = data.get("model")
+        if stored_model and stored_model != DEFAULT_MODEL:
+            raise ValueError(
+                f"Gallery at '{in_path}' was built with model "
+                f"'{stored_model}', but this module uses '{DEFAULT_MODEL}'. "
+                "Embeddings from different models are not comparable — "
+                "rebuild the gallery with scripts/build_gallery.py."
+            )
         return cls(
             labels=data["labels"],
             encodings=[np.array(e, dtype=np.float64) for e in data["encodings"]],
@@ -347,24 +385,24 @@ class FaceGallery:
     def from_paths(
         cls,
         image_paths: Sequence[PathLike],
-        model: str = DEFAULT_MODEL,
+        model_name: str = DEFAULT_MODEL,
+        detector_backend: str = DEFAULT_DETECTOR,
         skip_failures: bool = True,
     ) -> "FaceGallery":
         """
         Build a gallery from several photos of the same person.
 
-        Photos that contain no face (or more than one) are skipped with a
-        warning when skip_failures=True, so one bad photo doesn't sink
-        the whole gallery. For multi-face photos the largest face is
-        used, on the assumption it's the subject closest to the camera.
+        Photos with no detectable face are skipped with a warning when
+        skip_failures=True. For multi-face photos the largest face is
+        used, assuming the subject is closest to the camera.
         """
         labels, encodings = [], []
         for p in image_paths:
             p = Path(p)
             try:
-                matches = detect_faces(p, model=model)
-                if not matches:
-                    matches = detect_faces(p, model=model, upsample=2)
+                matches = detect_faces(
+                    p, model_name=model_name, detector_backend=detector_backend
+                )
                 if not matches:
                     raise NoFaceDetectedError(p)
                 matches.sort(
@@ -380,13 +418,13 @@ class FaceGallery:
 
 
 def save_encoding(encoding: np.ndarray, out_path: PathLike) -> None:
-    """Persist an encoding to disk as JSON, for later pipeline stages to load."""
+    """Persist an embedding to disk as JSON, for later pipeline stages."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(np.asarray(encoding).tolist()))
 
 
 def load_encoding(in_path: PathLike) -> np.ndarray:
-    """Load an encoding previously written by `save_encoding`."""
+    """Load an embedding previously written by `save_encoding`."""
     data = json.loads(Path(in_path).read_text())
     return np.array(data, dtype=np.float64)

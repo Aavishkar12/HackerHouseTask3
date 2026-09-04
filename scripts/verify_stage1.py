@@ -31,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from faceid.face_encode import (  # noqa: E402
+    DEFAULT_TOLERANCE,
+    EMBEDDING_DIM,
     MultipleFacesDetectedError,
     NoFaceDetectedError,
     compare_encodings,
@@ -85,8 +87,8 @@ def main() -> int:
     # 2. encoding shape / stats
     print("\n2) Encoding")
     enc = encode_face_from_path(image_path)
-    results.append(ok("shape (128,) float64",
-                      enc.shape == (128,) and enc.dtype == np.float64,
+    results.append(ok(f"shape ({EMBEDDING_DIM},) float64",
+                      enc.shape == (EMBEDDING_DIM,) and enc.dtype == np.float64,
                       f"shape={enc.shape} dtype={enc.dtype}"))
     print(f"       norm={np.linalg.norm(enc):.4f} min={enc.min():.4f} "
           f"max={enc.max():.4f} mean={enc.mean():.4f}")
@@ -94,7 +96,7 @@ def main() -> int:
     # 3. determinism
     print("\n3) Determinism")
     _, dist = compare_encodings(enc, encode_face_from_path(image_path))
-    results.append(ok("re-encoding gives distance ~0", dist < 1e-9,
+    results.append(ok("re-encoding gives distance ~0", dist < 1e-6,
                       f"distance={dist:.9f}"))
 
     # 4. save/load round-trip
@@ -112,7 +114,7 @@ def main() -> int:
     src.resize((src.width // 3, src.height // 3)).save(small_path, quality=70)
     is_match, dist = compare_encodings(enc, encode_face_from_path(small_path))
     results.append(ok("3x downscaled + recompressed still matches", is_match,
-                      f"distance={dist:.4f} (tolerance 0.6)"))
+                      f"distance={dist:.4f} (tolerance {DEFAULT_TOLERANCE})"))
 
     # 6. multiple faces
     print("\n6) Error handling — multiple faces")

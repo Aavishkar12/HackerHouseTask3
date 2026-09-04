@@ -27,12 +27,17 @@ distance for your own photos before trusting the threshold.
 import sys
 from pathlib import Path
 
-import numpy as np
+import numpy as np  # noqa: F401
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from faceid.face_encode import DEFAULT_TOLERANCE, FaceGallery  # noqa: E402
+from faceid.face_encode import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_TOLERANCE,
+    FaceGallery,
+    cosine_distance,
+)
 
 REFS_DIR = REPO_ROOT / "data" / "sample_images" / "refs"
 OUT_PATH = REPO_ROOT / "data" / "output" / "gallery.json"
@@ -77,7 +82,10 @@ def main() -> int:
         others = [e for j, e in enumerate(gallery.encodings) if j != i]
         if not others:
             continue
-        d = min(float(np.linalg.norm(gallery.encodings[i] - o)) for o in others)
+        # MUST be cosine — ArcFace embeddings are not calibrated for
+        # Euclidean distance, and mixing the two silently produces
+        # meaningless numbers.
+        d = min(cosine_distance(gallery.encodings[i], o) for o in others)
         worst = max(worst, d)
         flag = "" if d <= DEFAULT_TOLERANCE else "   <-- ABOVE TOLERANCE"
         print(f"      {label:<20s} closest match: {d:.3f}{flag}")

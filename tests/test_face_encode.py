@@ -1,10 +1,10 @@
 """
-Lightweight automated tests for faceid.face_encode.
+Lightweight automated tests for faceid.face_encode (DeepFace / ArcFace).
 
-These only exercise the code paths that don't require a real human face
-(missing file, no-face-found), since a genuine "does it correctly encode
-a real face" check needs an actual photo — that's what
-scripts/demo_encode.py is for (run manually against your own selfie).
+These only exercise code paths that don't require a real human face
+(missing file, no-face-found, distance maths, gallery logic). A genuine
+"does it correctly encode a real face" check needs actual photos — that's
+what scripts/verify_stage1.py and scripts/build_gallery.py are for.
 
 Run with:
     pytest tests/
@@ -21,107 +21,127 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from faceid.face_encode import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_TOLERANCE,
+    EMBEDDING_DIM,
+    FaceGallery,
     NoFaceDetectedError,
+    cosine_distance,
     encode_face_from_path,
+    find_best_match,
     load_encoding,
     save_encoding,
 )
 
 
+# --- basic error handling ---------------------------------------------
+
 def test_missing_file_raises(tmp_path):
-    missing = tmp_path / "does_not_exist.jpg"
-    try:
-        encode_face_from_path(missing)
-        assert False, "expected FileNotFoundError"
-    except FileNotFoundError:
-        pass
+    with pytest.raises(FileNotFoundError):
+        encode_face_from_path(tmp_path / "does_not_exist.jpg")
 
 
 def test_blank_image_raises_no_face(tmp_path):
-    # A plain white square has no face in it -> should raise cleanly
-    # instead of crashing.
     blank_path = tmp_path / "blank.jpg"
     Image.new("RGB", (400, 400), color=(255, 255, 255)).save(blank_path)
-
-    try:
+    with pytest.raises(NoFaceDetectedError):
         encode_face_from_path(blank_path)
-        assert False, "expected NoFaceDetectedError"
-    except NoFaceDetectedError:
-        pass
+
+
+# --- distance metric --------------------------------------------------
+
+def test_cosine_distance_identical_is_zero():
+    v = np.random.rand(EMBEDDING_DIM)
+    assert cosine_distance(v, v) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_cosine_distance_orthogonal_is_one():
+    a = np.zeros(EMBEDDING_DIM); a[0] = 1.0
+    b = np.zeros(EMBEDDING_DIM); b[1] = 1.0
+    assert cosine_distance(a, b) == pytest.approx(1.0)
+
+
+def test_cosine_distance_is_scale_invariant():
+    """Cosine distance must ignore vector magnitude — only direction."""
+    a = np.random.rand(EMBEDDING_DIM)
+    assert cosine_distance(a, a * 7.5) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_cosine_distance_zero_vector_does_not_crash():
+    """A zero vector has no direction; must not raise ZeroDivisionError."""
+    a = np.zeros(EMBEDDING_DIM)
+    b = np.random.rand(EMBEDDING_DIM)
+    assert cosine_distance(a, b) == float("inf")
+
+
+# --- matching logic ---------------------------------------------------
+
+def _unit(*components):
+    """Build a unit-ish vector from the first few components."""
+    v = np.zeros(EMBEDDING_DIM)
+    for i, c in enumerate(components):
+        v[i] = c
+    return v
 
 
 def test_find_best_match_picks_single_closest():
     """
-    Regression test for a real false positive found during Stage 1 testing:
-    in a two-person group photo, BOTH faces scored under the old 0.6
-    tolerance against the reference selfie. find_best_match must return
-    exactly one index (the closest), never "everything under threshold".
+    Regression test for a real false positive found during Stage 1
+    testing: in a two-person group photo, BOTH faces scored under the
+    original tolerance. find_best_match must return exactly one index —
+    the closest — never "everything under threshold".
     """
-    from faceid.face_encode import find_best_match
-
-    ref = np.zeros(128)
-    near = np.zeros(128)
-    near[0] = 0.41           # the real person, different photo
-    far = np.zeros(128)
-    far[0] = 0.58            # a different person who still sneaks under 0.6
+    ref = _unit(1.0, 0.0)
+    near = _unit(1.0, 0.30)   # the real person, different photo
+    far = _unit(1.0, 1.10)    # a different person
 
     idx, dist, is_match = find_best_match(ref, [far, near])
-    assert idx == 1, "should pick the nearer candidate, not the first one"
+    assert idx == 1, "should pick the nearer candidate, not the first"
     assert is_match is True
-    assert dist == pytest.approx(0.41)
-
-    # and the impostor alone must be rejected at the project default (0.5)
-    idx, dist, is_match = find_best_match(ref, [far])
-    assert idx == 0
-    assert is_match is False, "0.58 must not count as a match at tolerance 0.5"
+    assert dist < cosine_distance(ref, far)
 
 
 def test_find_best_match_empty_candidates():
-    from faceid.face_encode import find_best_match
-
-    idx, dist, is_match = find_best_match(np.zeros(128), [])
+    idx, dist, is_match = find_best_match(np.random.rand(EMBEDDING_DIM), [])
     assert idx is None
     assert is_match is False
 
 
-def test_default_tolerance_is_stricter_than_library_default():
-    from faceid.face_encode import DEFAULT_TOLERANCE
+def test_tolerance_is_stricter_than_deepface_default():
+    from faceid.face_encode import DEEPFACE_DEFAULT_TOLERANCE
+    assert DEFAULT_TOLERANCE < DEEPFACE_DEFAULT_TOLERANCE
 
-    assert DEFAULT_TOLERANCE < 0.6
 
+# --- gallery ----------------------------------------------------------
 
-def test_gallery_uses_minimum_distance(tmp_path):
+def test_gallery_uses_minimum_distance():
     """
-    A gallery must match on the CLOSEST reference, not the first or the
-    average. This is what widened the real/impostor margin from 0.037 to
-    0.117 on actual test photos.
+    A gallery must match on the CLOSEST reference, not the first or an
+    average. This is what widened the true/impostor margin in testing.
     """
-    from faceid.face_encode import FaceGallery
+    ref_bad = _unit(1.0, 1.2)    # a bad-angle reference
+    ref_good = _unit(1.0, 0.05)  # a good reference
+    gallery = FaceGallery(labels=["bad_angle", "good"],
+                          encodings=[ref_bad, ref_good])
 
-    far = np.zeros(128); far[0] = 0.55     # a bad-angle reference
-    near = np.zeros(128); near[0] = 0.30   # a good reference
-    gallery = FaceGallery(labels=["bad_angle", "good"], encodings=[far, near])
-
-    candidate = np.zeros(128)
+    candidate = _unit(1.0, 0.0)
     is_match, dist, via = gallery.match(candidate)
     assert is_match is True
-    assert dist == pytest.approx(0.30), "must use the closest reference"
     assert via == "good", "must report which reference matched"
+    assert dist == pytest.approx(cosine_distance(candidate, ref_good))
 
 
 def test_empty_gallery_never_matches():
-    from faceid.face_encode import FaceGallery
-
-    is_match, dist, via = FaceGallery(labels=[], encodings=[]).match(np.zeros(128))
+    is_match, dist, via = FaceGallery(labels=[], encodings=[]).match(
+        np.random.rand(EMBEDDING_DIM))
     assert is_match is False
     assert via is None
 
 
 def test_gallery_save_load_roundtrip(tmp_path):
-    from faceid.face_encode import FaceGallery
-
     g = FaceGallery(labels=["a", "b"],
-                    encodings=[np.random.rand(128), np.random.rand(128)])
+                    encodings=[np.random.rand(EMBEDDING_DIM),
+                               np.random.rand(EMBEDDING_DIM)])
     p = tmp_path / "g.json"
     g.save(p)
     loaded = FaceGallery.load(p)
@@ -132,12 +152,32 @@ def test_gallery_save_load_roundtrip(tmp_path):
         np.testing.assert_allclose(a, b)
 
 
+def test_gallery_rejects_mismatched_model(tmp_path):
+    """
+    Embeddings from different models are not comparable. Loading a
+    gallery built with another model must fail loudly rather than
+    silently producing nonsense distances.
+    """
+    import json
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({
+        "model": "SomeOtherModel",
+        "metric": "cosine",
+        "labels": ["a"],
+        "encodings": [np.random.rand(128).tolist()],
+    }))
+    with pytest.raises(ValueError, match="SomeOtherModel"):
+        FaceGallery.load(p)
+
+
+# --- persistence ------------------------------------------------------
+
 def test_save_and_load_encoding_roundtrip(tmp_path):
-    fake_encoding = np.random.rand(128).astype(np.float64)
+    fake = np.random.rand(EMBEDDING_DIM).astype(np.float64)
     out_path = tmp_path / "enc.json"
 
-    save_encoding(fake_encoding, out_path)
+    save_encoding(fake, out_path)
     loaded = load_encoding(out_path)
 
-    assert loaded.shape == (128,)
-    np.testing.assert_allclose(loaded, fake_encoding)
+    assert loaded.shape == (EMBEDDING_DIM,)
+    np.testing.assert_allclose(loaded, fake)

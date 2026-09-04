@@ -3,43 +3,48 @@
 Pipeline shape: **face scan → web/social search for a matching post →
 blockchain upload & re-verification of the discovered data.**
 
-This repo is built in stages. This README will grow as each stage lands.
+This repo is built in stages. This README grows as each stage lands.
 
 ## Status
 
-- [x] **Stage 1 — Face detection & encoding** (this stage) — verified
-      end-to-end against a real photo, 9/9 checks passing
+- [x] **Stage 1 — Face detection & encoding** — validated on 7 real
+      photos; 14 unit tests + 9 integration checks passing
 - [ ] Stage 2 — Web/social media search for a matching post
 - [ ] Stage 3 — Blockchain upload + re-verification
 
+---
+
 ## Stage 1: Face detection & encoding
 
-Detects a face in a photo and computes its 128-dimensional encoding
-using the [`face_recognition`](https://github.com/ageitgeit/face_recognition)
-library (dlib's ResNet face-recognition model under the hood).
+Detects a face in a photo and computes a 512-dimensional embedding using
+**[DeepFace](https://github.com/serengil/deepface) with the ArcFace
+model** and RetinaFace for detection.
 
 ### Project layout
 
 ```
 hh-goa-2026-pipeline/
 ├── requirements.txt          # pinned runtime deps
-├── requirements-dev.txt      # + pytest, for running tests
+├── requirements-dev.txt      # + pytest
+├── .env.example              # credential template (copy to .env)
 ├── src/
 │   └── faceid/
 │       ├── __init__.py
-│       └── face_encode.py    # reusable, importable encoding functions
+│       └── face_encode.py    # reusable, importable encoding + matching
 ├── scripts/
-│   ├── demo_encode.py        # CLI demo: encode a sample photo, save the result
-│   └── verify_stage1.py      # full self-check (detection, determinism, error paths)
+│   ├── demo_encode.py        # CLI demo: encode one photo, save the result
+│   ├── build_gallery.py      # build a multi-photo reference gallery
+│   └── verify_stage1.py      # full self-check (9 integration checks)
 ├── tests/
-│   └── test_face_encode.py   # automated tests for error handling
+│   └── test_face_encode.py   # unit tests
 └── data/
-    ├── sample_images/        # put your test photo here (git-ignored)
-    └── output/                # saved encodings land here (git-ignored)
+    ├── sample_images/        # your photos (git-ignored)
+    │   └── refs/             # gallery reference photos
+    └── output/               # embeddings + gallery land here (git-ignored)
 ```
 
-Later stages (web search, blockchain) will import from
-`src/faceid/face_encode.py` rather than duplicating detection logic.
+Stages 2 and 3 import from `src/faceid/face_encode.py` rather than
+duplicating detection or matching logic.
 
 ### Setup
 
@@ -50,80 +55,50 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**Install notes (dlib):** `face_recognition` depends on `dlib`, which is
-compiled from source by pip and needs a C++ toolchain + CMake:
+**Install notes:** DeepFace pulls in TensorFlow, so the install is large
+(~2.5GB virtualenv). On first run it downloads ~335MB of model weights
+to `~/.deepface/weights/` — the first encode takes ~15s, subsequent ones
+~3.7s per image on CPU. No compiler or CMake needed (unlike dlib).
 
-- **Ubuntu/Debian:** `sudo apt-get install -y cmake build-essential`
-- **macOS:** `xcode-select --install` and `brew install cmake`
-- **Windows:** install "Desktop development with C++" via the Visual
-  Studio Build Tools, plus [CMake](https://cmake.org/download/). If the
-  dlib build still fails, the easiest fix is usually
-  `pip install cmake` first, then retry `pip install dlib`.
-
-If dlib/`face_recognition` genuinely won't build on your machine, the
-recommended fallback is `mediapipe` (`pip install mediapipe`) or
-`insightface`, either of which can be swapped in behind the same
-`encode_face_from_path(...)` function signature in `face_encode.py`.
-**In this environment, dlib and face_recognition built and installed
-without any issues**, so no fallback was needed — see "Why
-face_recognition" below.
-
-### Add your test photo
-
-Drop a clear, front-facing photo of yourself at:
+### Add your photos
 
 ```
-data/sample_images/me.jpg
+data/sample_images/me.jpg          # single test photo
+data/sample_images/refs/*.jpg      # 4-6 varied photos for the gallery
 ```
 
-(or pass any other path as an argument — see below).
+Use varied conditions for the gallery — different days, lighting,
+angles, with and without glasses. Variety matters more than count.
 
-### Run the demo
+### Run
 
 ```bash
+# encode one photo
 python scripts/demo_encode.py
-# or: python scripts/demo_encode.py path/to/any/photo.jpg
-```
+python scripts/demo_encode.py path/to/any/photo.jpg
 
-Expected output on success:
+# build the reference gallery (+ leave-one-out validation)
+python scripts/build_gallery.py
 
-```
-[*] Encoding face(s) in: data/sample_images/me.jpg
-[+] Success — got one face encoding.
-    shape: (128,), dtype: float64
-    first 8 values: [...]
-[+] Saved full encoding to: data/output/me_encoding.json
-```
-
-The saved JSON file is what Stage 2 (web search) will eventually load
-via `faceid.face_encode.load_encoding(...)`.
-
-### Verify the whole stage
-
-`demo_encode.py` just proves it runs. To prove it actually *works*:
-
-```bash
+# full self-check
 python scripts/verify_stage1.py
 ```
 
-This runs 9 checks — detection + bounding box (saved as an annotated
-image you can eyeball), encoding shape/dtype, determinism, JSON
-round-trip, robustness to downscaling/re-compression, and all three
-error paths. Verified output on a real test photo:
+Verified `verify_stage1.py` output on a real photo:
 
 ```
 1) Detection
   [PASS] exactly one face found — 1 face(s)
-       bbox (top,right,bottom,left) = (759, 605, 1221, 142) -> 463x462px
+       bbox (top,right,bottom,left) = (703, 589, 1251, 172) -> 417x548px
 2) Encoding
-  [PASS] shape (128,) float64
-       norm=1.3703 min=-0.3127 max=0.3744 mean=-0.0028
+  [PASS] shape (512,) float64
+       norm=3.3293 min=-0.5409 max=0.4123 mean=0.0058
 3) Determinism
   [PASS] re-encoding gives distance ~0 — distance=0.000000000
 4) Persistence
   [PASS] JSON round-trip lossless
 5) Robustness (same person, degraded image)
-  [PASS] 3x downscaled + recompressed still matches — distance=0.0900 (tolerance 0.6)
+  [PASS] 3x downscaled + recompressed still matches — distance=0.0478
 6) Error handling — multiple faces
   [PASS] raises MultipleFacesDetectedError — num_faces=2
   [PASS] allow_multiple=True returns both — 2 encodings
@@ -135,179 +110,159 @@ error paths. Verified output on a real test photo:
   Stage 1 verification: 9/9 checks passed
 ```
 
-Encoding a single photo takes ~4s on CPU with the `hog` model.
-
 ### Error handling
 
-- **No face found** → raises `NoFaceDetectedError` with a clear message
-  (demo script prints it and exits non-zero instead of crashing).
-- **More than one face found** → raises `MultipleFacesDetectedError`
-  by default. Callers that *want* every face can pass
-  `allow_multiple=True` to get a list of encodings back instead.
-- **Missing file** → a plain `FileNotFoundError` with the path that was
-  looked for.
+- **No face found** → `NoFaceDetectedError`
+- **More than one face** → `MultipleFacesDetectedError` (pass
+  `allow_multiple=True` to get every face instead)
+- **Missing file** → `FileNotFoundError`
 
-These are exercised by the automated tests:
+All subclass `FaceEncodingError` except the last. A failed encode writes
+**no output file**, so bad input can't leak into the Stage 3 hashing step.
+
+Tested against a non-face image (a stock photo of a tree): 0 faces
+detected, no false positives, clean rejection.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/
+pytest tests/          # 14 tests
 ```
 
-(The automated tests only cover the missing-file and no-face-found
-paths, since a true positive-path test needs a real face — that's what
-running `scripts/demo_encode.py` against your own photo is for.)
+---
 
-### Why `face_recognition`
+### Why DeepFace / ArcFace (and not dlib)
 
-Per the task brief's suggested approach, `face_recognition` (dlib-based)
-was tried first since it gets encoding + matching working the fastest.
-It built and installed cleanly in this environment (cmake and a C++
-compiler were already present), so **no fallback to `mediapipe` /
-`insightface` was needed**. If you hit a dlib build failure on your own
-machine, see the install notes above, or swap the implementation inside
-`encode_face_from_path()` for a `mediapipe`/`insightface`-based one — the
-function signature (`image_path -> np.ndarray` of a fixed-length
-encoding) is designed to stay the same either way, so nothing downstream
-would need to change.
+Both backends were benchmarked on the **same** 7 real photos — 6 of one
+person across varied lighting, indoor/outdoor, glasses/no-glasses and
+angles, plus 1 impostor — using identical leave-one-out methodology.
+
+Raw distances aren't comparable across backends (dlib uses Euclidean on
+128-d vectors, DeepFace uses cosine on 512-d), so these are scale-free:
+
+| Backend | Separation ratio | Normalised margin | Works without a gallery? | Speed |
+|---|---|---|---|---|
+| dlib / face_recognition | 1.263 | 0.208 | no — distributions overlap | 4.0s |
+| DeepFace Facenet512 | 1.334 | 0.250 | no — distributions overlap | 3.5s |
+| **DeepFace ArcFace** | **1.423** | **0.297** | **yes** | **3.7s** |
+
+*separation ratio* = impostor distance ÷ worst true-match distance
+(higher is better; 1.0 means they touch).
+*normalised margin* = (impostor − worst true) ÷ impostor.
+
+ArcFace gives **~43% more headroom** than dlib and was the only backend
+that still separated correctly without a reference gallery. It's trained
+on more demographically diverse data than dlib's model — relevant here,
+since the false positive that prompted this comparison was between two
+South Asian men.
+
+**Trade-off:** DeepFace pulls in TensorFlow — ~2.5GB virtualenv versus
+~271MB for dlib, plus ~335MB of weights on first run. Per-image speed is
+comparable. dlib remained viable (the gallery fixed its false positive),
+but ArcFace was chosen for the wider margin.
+
+### Why matching uses a multi-photo gallery
+
+**One reference photo is not enough.** Leave-one-out on 6 photos of one
+person + 1 impostor, cosine distance with ArcFace:
+
+| Approach | Same person | Impostor | Margin |
+|---|---|---|---|
+| Single reference | up to **0.7435** | **0.7662** | 0.023 — separable, barely |
+| **Gallery (minimum over refs)** | up to **0.5384** | **0.7662** | **0.2278 — ~10× wider** |
+
+With dlib the single-reference case was worse still: two photos of the
+*same* person scored 0.602 apart while a *different* person sat at
+0.562 — the distributions overlapped outright, so no threshold could
+work at all.
+
+Matching against a gallery and taking the **minimum** distance means the
+candidate only has to resemble the person in *one* reference photo,
+which is what makes it robust to lighting and pose.
+
+Per-photo leave-one-out (ArcFace, gallery of 6):
+
+| Reference | Closest match |
+|---|---|
+| original | 0.421 |
+| mirror selfie | 0.527 |
+| indoor (bed) | 0.212 |
+| **outdoor, harsh sun** | **0.538** ← worst |
+| indoor | 0.212 |
+| indoor 2 | 0.249 |
+| **impostor** | **0.766** |
+
+Real result on a two-person group photo:
+
+| Face | Distance | Verdict |
+|---|---|---|
+| The subject | **0.346** | MATCH |
+| A different person | **0.758** | no match |
+
+### Matching threshold — why 0.65
+
+DeepFace's calibrated default for ArcFace + cosine is **0.68**. This
+project uses **0.65**, slightly stricter, based on the measurements
+above: worst true match 0.5384, impostor 0.7662 — 0.65 sits near the
+midpoint with ~0.11 headroom either side.
+
+The bias toward strictness is deliberate. In Stage 2 a false positive
+means claiming a **stranger's** social media post belongs to the user,
+and Stage 3 then writes that claim to a blockchain permanently. A missed
+match is recoverable; a wrong match written on-chain is not.
 
 ### API reference (for later stages)
 
 ```python
 from faceid.face_encode import (
-    encode_face_from_path,      # main entry point
-    encode_face_from_array,     # for in-memory / downloaded images
+    encode_face_from_path,      # main entry point -> (512,) ndarray
+    encode_face_from_array,     # for images downloaded in Stage 2
     detect_faces,               # low-level: all faces + locations
-    compare_encodings,          # (is_match, distance) between two encodings
-    find_best_match,            # closest of N candidates -> (index, distance, is_match)
-    save_encoding, load_encoding,  # persist/reload an encoding as JSON
-    NoFaceDetectedError,
-    MultipleFacesDetectedError,
+    compare_encodings,          # (is_match, distance)
+    find_best_match,            # closest of N -> (index, distance, is_match)
+    cosine_distance,            # the metric ArcFace is calibrated for
+    FaceGallery,                # multi-reference matching
+    save_encoding, load_encoding,
+    NoFaceDetectedError, MultipleFacesDetectedError,
 )
 
-encoding = encode_face_from_path("data/sample_images/me.jpg")
-# encoding: np.ndarray, shape (128,), dtype float64
-```
-
-## Why matching uses a multi-photo gallery, not one reference
-
-**One reference photo is not enough.** Measured on 6 photos of the same
-person (varied lighting, indoor/outdoor, glasses/no glasses, different
-angles) plus 1 impostor:
-
-| Approach | Same person | Impostor | Result |
-|---|---|---|---|
-| **Single reference** (all pairs) | 0.297 – **0.602** | **0.562** – 0.707 | **overlap by 0.040 — no threshold works** |
-| **Gallery** (min over refs, leave-one-out) | 0.297 – **0.445** | **0.562** | **clean gap of 0.117** |
-
-With a single reference, two photos of the *same person* were 0.602
-apart, while a *different person* sat at 0.562 — the distributions
-overlap, so any threshold either misses real matches or lets impostors
-through. Matching against a gallery and taking the **minimum** distance
-collapses the same-person spread to 0.445 and separates cleanly.
-
-The candidate only has to resemble the person in *one* reference photo,
-which is exactly what makes it robust to lighting and pose.
-
-Build a gallery with:
-
-```bash
-# put several photos of one person in data/sample_images/refs/
-python scripts/build_gallery.py
-```
-
-It writes `data/output/gallery.json` and runs a leave-one-out check so
-you can see the worst-case true-match distance for *your* photos before
-trusting the threshold.
-
-```python
-from faceid.face_encode import FaceGallery
-
 gallery = FaceGallery.load("data/output/gallery.json")
-is_match, distance, which_ref = gallery.match(candidate_encoding)
+is_match, distance, which_ref = gallery.match(candidate_embedding)
 ```
 
-Real result on a two-person group photo, gallery of 6:
+`FaceGallery.load()` refuses to load a gallery built with a different
+model, since embeddings from different models are not comparable.
 
-| Face | Distance | Verdict |
-|---|---|---|
-| The subject | 0.410 | MATCH |
-| A different person | 0.562 | no match |
-
-## Matching threshold — why 0.5, not 0.6
-
-`face_recognition`'s documented default tolerance is **0.6**. Testing on
-real photos showed that is **too loose for this pipeline**, so this
-project defaults to **0.5** (`DEFAULT_TOLERANCE` in `face_encode.py`).
-
-Measured distances on our own test images:
-
-| Comparison | Distance |
-|---|---|
-| Same person, same photo downscaled 3× + recompressed | **0.09** |
-| Same person, different photo (pose/lighting/camera differ) | **0.41** |
-| **Different people** (two friends in one group photo) | **0.58** |
-
-At tolerance 0.6 the *different person* is a false positive. A threshold
-sweep confirms the safe band:
-
-| Tolerance | Real match found | Impostor rejected | Verdict |
-|---|---|---|---|
-| 0.60 | yes | **no** | false positive |
-| 0.55 | yes | yes | correct |
-| **0.50** | yes | yes | **correct (project default)** |
-| 0.45 | yes | yes | correct |
-| 0.40 | **no** | yes | too strict, misses real match |
-
-Raising `num_jitters` from 1 → 50 barely moved the numbers (0.5775 →
-0.5635 for the impostor), so this is a threshold problem, not an
-encoding-quality problem — jittering is not a fix.
-
-This matters most for Stage 2: a false positive there means claiming a
-**stranger's** social media post belongs to you. Hence `find_best_match()`,
-which returns the *single closest* face rather than every face under the
-threshold — in a group photo more than one face can pass.
+---
 
 ## Known limitations (Stage 1)
 
-- **Matching is not identity proof.** A 128-d encoding distance is a
-  similarity score, not a guarantee. Even with a 6-photo gallery the gap
-  between the worst true match (0.445) and the impostor (0.562) is only
-  0.117 wide, so genuinely similar-looking people — relatives especially
-  — can land close to the boundary.
+- **Matching is not identity proof.** Distance is a similarity score, not
+  a guarantee. Even with a 6-photo gallery the gap between the worst true
+  match (0.538) and the impostor (0.766) is 0.228 wide, so genuinely
+  similar-looking people — relatives especially — can land near the
+  boundary.
 - **The threshold is validated on a small sample:** 6 photos of one
-  person and 1 impostor. That is enough to show the single-reference
-  approach fails, but it is not a rigorous FAR/FRR evaluation. Treat
-  Stage 2 matches as *candidates* and always surface the distance
-  alongside the verdict rather than a bare yes/no.
-- **Hard photos degrade fast.** The worst reference in testing (bright
-  direct sunlight, heavy shadow, glasses with glare) sat at 0.445 —
-  furthest from every other photo of the same person. Backlit or
-  strongly side-lit images are the weak point.
-- **Known model bias.** dlib's face-recognition model was trained largely
-  on Western/white face datasets and has documented higher error rates on
-  other demographics. The false positive found during testing was between
-  two South Asian men, which is consistent with that. The stricter 0.5
-  threshold mitigates but does not remove this.
-- Uses the `"hog"` detection model (fast, CPU-only); it's less accurate
-  on small, angled, or poorly-lit faces than the `"cnn"` model, which
-  needs a GPU to run at reasonable speed. Pass `model="cnn"` to
-  `encode_face_from_path` if a GPU is available. (Note: the CNN model
-  did *not* fix the false positive above — again, threshold, not model.)
-- Only handles one face per image by default (by design, since this
-  pipeline is about identifying one person); `allow_multiple=True` is
-  available for multi-face images.
-- Encoding takes ~4s per photo on CPU with `hog`; the `cnn` model is
-  meaningfully slower on CPU.
+  person and 1 impostor. Enough to show single-reference matching was
+  broken; not a rigorous FAR/FRR evaluation. Stage 2 should surface the
+  distance alongside every verdict rather than a bare yes/no.
+- **Hard photos degrade fast.** The worst reference (bright direct
+  sunlight, heavy shadow, glare on glasses) sat at 0.538 — closest to
+  the threshold of any true match. Backlit and strongly side-lit images
+  are the weak point.
+- **Demographic bias.** ArcFace is better than dlib here but no face
+  model is neutral; error rates still vary across demographics.
+- **Heavy install.** TensorFlow + model weights make this a ~2.8GB
+  footprint, and the first run needs internet to fetch weights.
+- Uses the `retinaface` detector (most accurate DeepFace offers). Swap
+  to `opencv` via `detector_backend=` for speed at some accuracy cost.
 
-## Stages 2 & 3
+## Stages 2 & 3 (to follow)
 
-To follow, once Stage 1 is confirmed working end-to-end against a real
-photo:
+- **Stage 2:** use the face gallery to run a genuine reverse-image / web
+  search (Google Cloud Vision web detection) and find a real matching
+  social media post.
+- **Stage 3:** hash the discovered post and write it to a blockchain,
+  then demonstrate re-verification against the on-chain record.
 
-- **Stage 2:** use the face encoding to run a genuine web/reverse-image
-  search (e.g. a Vision API's web-detection feature) and find a real
-  matching social media post.
-- **Stage 3:** hash the discovered post and write it to a blockchain
-  (local/simulated, testnet, or mainnet), then demonstrate
-  re-verification against the on-chain record.
+Credentials go in `.env` (see `.env.example`). `.env`, service-account
+JSONs and `*-key.json` are git-ignored — never commit real keys.

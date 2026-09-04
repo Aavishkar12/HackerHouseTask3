@@ -3,7 +3,7 @@
 demo_encode.py — Task 1 demo/verification script.
 
 Loads a sample photo, runs it through faceid.face_encode, and prints +
-saves the resulting 128-d face encoding so you can confirm the pipeline
+saves the resulting 512-d face embedding so you can confirm the pipeline
 works before moving on to Task 2 (web/social search).
 
 Usage
