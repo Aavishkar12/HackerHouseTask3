@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
@@ -47,6 +48,46 @@ def test_blank_image_raises_no_face(tmp_path):
         assert False, "expected NoFaceDetectedError"
     except NoFaceDetectedError:
         pass
+
+
+def test_find_best_match_picks_single_closest():
+    """
+    Regression test for a real false positive found during Stage 1 testing:
+    in a two-person group photo, BOTH faces scored under the old 0.6
+    tolerance against the reference selfie. find_best_match must return
+    exactly one index (the closest), never "everything under threshold".
+    """
+    from faceid.face_encode import find_best_match
+
+    ref = np.zeros(128)
+    near = np.zeros(128)
+    near[0] = 0.41           # the real person, different photo
+    far = np.zeros(128)
+    far[0] = 0.58            # a different person who still sneaks under 0.6
+
+    idx, dist, is_match = find_best_match(ref, [far, near])
+    assert idx == 1, "should pick the nearer candidate, not the first one"
+    assert is_match is True
+    assert dist == pytest.approx(0.41)
+
+    # and the impostor alone must be rejected at the project default (0.5)
+    idx, dist, is_match = find_best_match(ref, [far])
+    assert idx == 0
+    assert is_match is False, "0.58 must not count as a match at tolerance 0.5"
+
+
+def test_find_best_match_empty_candidates():
+    from faceid.face_encode import find_best_match
+
+    idx, dist, is_match = find_best_match(np.zeros(128), [])
+    assert idx is None
+    assert is_match is False
+
+
+def test_default_tolerance_is_stricter_than_library_default():
+    from faceid.face_encode import DEFAULT_TOLERANCE
+
+    assert DEFAULT_TOLERANCE < 0.6
 
 
 def test_save_and_load_encoding_roundtrip(tmp_path):

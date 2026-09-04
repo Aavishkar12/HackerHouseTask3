@@ -57,6 +57,20 @@ PathLike = Union[str, Path]
 # "cnn" is far more accurate but needs a GPU (or is very slow on CPU).
 DEFAULT_MODEL = "hog"
 
+# face_recognition's own documented default is 0.6, but that is measurably
+# too loose for this pipeline. Measured on our own test data:
+#
+#   same person, same photo downscaled 3x + recompressed .... 0.09
+#   same person, different photo/pose/lighting/camera ........ 0.41
+#   DIFFERENT people (two friends in one group photo) ........ 0.58
+#
+# At 0.6 the different person is a false positive; at 0.5 the real match
+# still passes with room to spare and the impostor is correctly rejected.
+# Stage 2 will be comparing against faces found on the open web, where a
+# false positive means claiming a stranger's post belongs to you — so we
+# bias toward strictness. Override per-call if you need to.
+DEFAULT_TOLERANCE = 0.5
+
 
 class FaceEncodingError(Exception):
     """Base class for all face-encoding errors raised by this module."""
@@ -222,19 +236,52 @@ def encode_face_from_array(
 def compare_encodings(
     known_encoding: np.ndarray,
     candidate_encoding: np.ndarray,
-    tolerance: float = 0.6,
+    tolerance: float = DEFAULT_TOLERANCE,
 ) -> tuple[bool, float]:
     """
     Compare two face encodings.
 
-    Returns (is_match, distance). Lower distance = more similar;
-    face_recognition's own default tolerance is 0.6, which is what most
-    guides use as "same person" cutoff.
+    Returns (is_match, distance). Lower distance = more similar.
+
+    See DEFAULT_TOLERANCE above for why this project uses 0.5 rather
+    than face_recognition's documented 0.6 default.
     """
     distance = float(
         np.linalg.norm(np.asarray(known_encoding) - np.asarray(candidate_encoding))
     )
     return distance <= tolerance, distance
+
+
+def find_best_match(
+    known_encoding: np.ndarray,
+    candidates: Sequence[np.ndarray],
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> tuple[Optional[int], float, bool]:
+    """
+    Given one reference encoding and several candidate encodings (e.g.
+    every face found in a group photo, or in an image scraped from a
+    search result), return the SINGLE closest candidate.
+
+    This is what Stage 2 should use rather than "every face under the
+    threshold": in a group photo more than one face can sit under the
+    tolerance, and picking all of them would mean claiming a stranger's
+    post belongs to you.
+
+    Returns:
+        (index_of_closest, distance, is_match)
+        index is None if `candidates` was empty. `is_match` is False
+        when even the closest candidate is beyond `tolerance`.
+    """
+    if len(candidates) == 0:
+        return None, float("inf"), False
+
+    distances = [
+        float(np.linalg.norm(np.asarray(known_encoding) - np.asarray(c)))
+        for c in candidates
+    ]
+    best_idx = int(np.argmin(distances))
+    best_distance = distances[best_idx]
+    return best_idx, best_distance, best_distance <= tolerance
 
 
 def save_encoding(encoding: np.ndarray, out_path: PathLike) -> None:

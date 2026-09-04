@@ -179,6 +179,7 @@ from faceid.face_encode import (
     encode_face_from_array,     # for in-memory / downloaded images
     detect_faces,               # low-level: all faces + locations
     compare_encodings,          # (is_match, distance) between two encodings
+    find_best_match,            # closest of N candidates -> (index, distance, is_match)
     save_encoding, load_encoding,  # persist/reload an encoding as JSON
     NoFaceDetectedError,
     MultipleFacesDetectedError,
@@ -188,15 +189,63 @@ encoding = encode_face_from_path("data/sample_images/me.jpg")
 # encoding: np.ndarray, shape (128,), dtype float64
 ```
 
+## Matching threshold — why 0.5, not 0.6
+
+`face_recognition`'s documented default tolerance is **0.6**. Testing on
+real photos showed that is **too loose for this pipeline**, so this
+project defaults to **0.5** (`DEFAULT_TOLERANCE` in `face_encode.py`).
+
+Measured distances on our own test images:
+
+| Comparison | Distance |
+|---|---|
+| Same person, same photo downscaled 3× + recompressed | **0.09** |
+| Same person, different photo (pose/lighting/camera differ) | **0.41** |
+| **Different people** (two friends in one group photo) | **0.58** |
+
+At tolerance 0.6 the *different person* is a false positive. A threshold
+sweep confirms the safe band:
+
+| Tolerance | Real match found | Impostor rejected | Verdict |
+|---|---|---|---|
+| 0.60 | yes | **no** | false positive |
+| 0.55 | yes | yes | correct |
+| **0.50** | yes | yes | **correct (project default)** |
+| 0.45 | yes | yes | correct |
+| 0.40 | **no** | yes | too strict, misses real match |
+
+Raising `num_jitters` from 1 → 50 barely moved the numbers (0.5775 →
+0.5635 for the impostor), so this is a threshold problem, not an
+encoding-quality problem — jittering is not a fix.
+
+This matters most for Stage 2: a false positive there means claiming a
+**stranger's** social media post belongs to you. Hence `find_best_match()`,
+which returns the *single closest* face rather than every face under the
+threshold — in a group photo more than one face can pass.
+
 ## Known limitations (Stage 1)
 
+- **Matching is not identity proof.** A 128-d encoding distance is a
+  similarity score, not a guarantee. The measured gap between "same
+  person, different photo" (0.41) and "different person" (0.58) is only
+  ~0.17 wide, so genuinely similar-looking people — especially relatives,
+  or people of a similar age/build wearing similar glasses — can land
+  close to the boundary.
+- **Known model bias.** dlib's face-recognition model was trained largely
+  on Western/white face datasets and has documented higher error rates on
+  other demographics. The false positive found during testing was between
+  two South Asian men, which is consistent with that. The stricter 0.5
+  threshold mitigates but does not remove this.
 - Uses the `"hog"` detection model (fast, CPU-only); it's less accurate
   on small, angled, or poorly-lit faces than the `"cnn"` model, which
   needs a GPU to run at reasonable speed. Pass `model="cnn"` to
-  `encode_face_from_path` if a GPU is available.
+  `encode_face_from_path` if a GPU is available. (Note: the CNN model
+  did *not* fix the false positive above — again, threshold, not model.)
 - Only handles one face per image by default (by design, since this
   pipeline is about identifying one person); `allow_multiple=True` is
   available for multi-face images.
+- Encoding takes ~4s per photo on CPU with `hog`; the `cnn` model is
+  meaningfully slower on CPU.
 
 ## Stages 2 & 3
 
