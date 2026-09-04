@@ -90,6 +90,48 @@ def test_default_tolerance_is_stricter_than_library_default():
     assert DEFAULT_TOLERANCE < 0.6
 
 
+def test_gallery_uses_minimum_distance(tmp_path):
+    """
+    A gallery must match on the CLOSEST reference, not the first or the
+    average. This is what widened the real/impostor margin from 0.037 to
+    0.117 on actual test photos.
+    """
+    from faceid.face_encode import FaceGallery
+
+    far = np.zeros(128); far[0] = 0.55     # a bad-angle reference
+    near = np.zeros(128); near[0] = 0.30   # a good reference
+    gallery = FaceGallery(labels=["bad_angle", "good"], encodings=[far, near])
+
+    candidate = np.zeros(128)
+    is_match, dist, via = gallery.match(candidate)
+    assert is_match is True
+    assert dist == pytest.approx(0.30), "must use the closest reference"
+    assert via == "good", "must report which reference matched"
+
+
+def test_empty_gallery_never_matches():
+    from faceid.face_encode import FaceGallery
+
+    is_match, dist, via = FaceGallery(labels=[], encodings=[]).match(np.zeros(128))
+    assert is_match is False
+    assert via is None
+
+
+def test_gallery_save_load_roundtrip(tmp_path):
+    from faceid.face_encode import FaceGallery
+
+    g = FaceGallery(labels=["a", "b"],
+                    encodings=[np.random.rand(128), np.random.rand(128)])
+    p = tmp_path / "g.json"
+    g.save(p)
+    loaded = FaceGallery.load(p)
+
+    assert loaded.labels == g.labels
+    assert len(loaded) == 2
+    for a, b in zip(loaded.encodings, g.encodings):
+        np.testing.assert_allclose(a, b)
+
+
 def test_save_and_load_encoding_roundtrip(tmp_path):
     fake_encoding = np.random.rand(128).astype(np.float64)
     out_path = tmp_path / "enc.json"

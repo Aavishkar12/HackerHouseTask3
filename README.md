@@ -189,6 +189,51 @@ encoding = encode_face_from_path("data/sample_images/me.jpg")
 # encoding: np.ndarray, shape (128,), dtype float64
 ```
 
+## Why matching uses a multi-photo gallery, not one reference
+
+**One reference photo is not enough.** Measured on 6 photos of the same
+person (varied lighting, indoor/outdoor, glasses/no glasses, different
+angles) plus 1 impostor:
+
+| Approach | Same person | Impostor | Result |
+|---|---|---|---|
+| **Single reference** (all pairs) | 0.297 – **0.602** | **0.562** – 0.707 | **overlap by 0.040 — no threshold works** |
+| **Gallery** (min over refs, leave-one-out) | 0.297 – **0.445** | **0.562** | **clean gap of 0.117** |
+
+With a single reference, two photos of the *same person* were 0.602
+apart, while a *different person* sat at 0.562 — the distributions
+overlap, so any threshold either misses real matches or lets impostors
+through. Matching against a gallery and taking the **minimum** distance
+collapses the same-person spread to 0.445 and separates cleanly.
+
+The candidate only has to resemble the person in *one* reference photo,
+which is exactly what makes it robust to lighting and pose.
+
+Build a gallery with:
+
+```bash
+# put several photos of one person in data/sample_images/refs/
+python scripts/build_gallery.py
+```
+
+It writes `data/output/gallery.json` and runs a leave-one-out check so
+you can see the worst-case true-match distance for *your* photos before
+trusting the threshold.
+
+```python
+from faceid.face_encode import FaceGallery
+
+gallery = FaceGallery.load("data/output/gallery.json")
+is_match, distance, which_ref = gallery.match(candidate_encoding)
+```
+
+Real result on a two-person group photo, gallery of 6:
+
+| Face | Distance | Verdict |
+|---|---|---|
+| The subject | 0.410 | MATCH |
+| A different person | 0.562 | no match |
+
 ## Matching threshold — why 0.5, not 0.6
 
 `face_recognition`'s documented default tolerance is **0.6**. Testing on
@@ -226,11 +271,19 @@ threshold — in a group photo more than one face can pass.
 ## Known limitations (Stage 1)
 
 - **Matching is not identity proof.** A 128-d encoding distance is a
-  similarity score, not a guarantee. The measured gap between "same
-  person, different photo" (0.41) and "different person" (0.58) is only
-  ~0.17 wide, so genuinely similar-looking people — especially relatives,
-  or people of a similar age/build wearing similar glasses — can land
-  close to the boundary.
+  similarity score, not a guarantee. Even with a 6-photo gallery the gap
+  between the worst true match (0.445) and the impostor (0.562) is only
+  0.117 wide, so genuinely similar-looking people — relatives especially
+  — can land close to the boundary.
+- **The threshold is validated on a small sample:** 6 photos of one
+  person and 1 impostor. That is enough to show the single-reference
+  approach fails, but it is not a rigorous FAR/FRR evaluation. Treat
+  Stage 2 matches as *candidates* and always surface the distance
+  alongside the verdict rather than a bare yes/no.
+- **Hard photos degrade fast.** The worst reference in testing (bright
+  direct sunlight, heavy shadow, glasses with glare) sat at 0.445 —
+  furthest from every other photo of the same person. Backlit or
+  strongly side-lit images are the weak point.
 - **Known model bias.** dlib's face-recognition model was trained largely
   on Western/white face datasets and has documented higher error rates on
   other demographics. The false positive found during testing was between

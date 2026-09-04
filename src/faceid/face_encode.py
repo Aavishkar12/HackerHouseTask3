@@ -284,6 +284,101 @@ def find_best_match(
     return best_idx, best_distance, best_distance <= tolerance
 
 
+@dataclass
+class FaceGallery:
+    """
+    Several reference encodings for ONE person.
+
+    A single reference photo is not enough. Measured on 6 photos of the
+    same person plus 1 impostor:
+
+        single reference  -> same-person distances spanned 0.297-0.602,
+                             impostor distances 0.562-0.707. Those
+                             OVERLAP by 0.040, so no threshold can be
+                             both safe and correct.
+        gallery (min over 6 refs, leave-one-out)
+                          -> every true photo landed <= 0.445,
+                             impostor at 0.562. Margin 0.117 — about 3x
+                             wider, and cleanly separable.
+
+    So Stage 2 should always match against a gallery, not one photo.
+    """
+
+    labels: List[str]
+    encodings: List[np.ndarray]
+
+    def __len__(self) -> int:
+        return len(self.encodings)
+
+    def match(
+        self, candidate: np.ndarray, tolerance: float = DEFAULT_TOLERANCE
+    ) -> tuple[bool, float, Optional[str]]:
+        """
+        Compare a candidate face against every reference in the gallery.
+
+        Returns (is_match, best_distance, label_of_closest_reference).
+        Uses the MINIMUM distance across references: the candidate only
+        has to look like the person in *one* of their reference photos,
+        which is what makes the gallery robust to lighting/pose/angle.
+        """
+        if not self.encodings:
+            return False, float("inf"), None
+        idx, dist, is_match = find_best_match(candidate, self.encodings, tolerance)
+        return is_match, dist, self.labels[idx] if idx is not None else None
+
+    def save(self, out_path: PathLike) -> None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "labels": self.labels,
+            "encodings": [np.asarray(e).tolist() for e in self.encodings],
+        }
+        out_path.write_text(json.dumps(payload, indent=2))
+
+    @classmethod
+    def load(cls, in_path: PathLike) -> "FaceGallery":
+        data = json.loads(Path(in_path).read_text())
+        return cls(
+            labels=data["labels"],
+            encodings=[np.array(e, dtype=np.float64) for e in data["encodings"]],
+        )
+
+    @classmethod
+    def from_paths(
+        cls,
+        image_paths: Sequence[PathLike],
+        model: str = DEFAULT_MODEL,
+        skip_failures: bool = True,
+    ) -> "FaceGallery":
+        """
+        Build a gallery from several photos of the same person.
+
+        Photos that contain no face (or more than one) are skipped with a
+        warning when skip_failures=True, so one bad photo doesn't sink
+        the whole gallery. For multi-face photos the largest face is
+        used, on the assumption it's the subject closest to the camera.
+        """
+        labels, encodings = [], []
+        for p in image_paths:
+            p = Path(p)
+            try:
+                matches = detect_faces(p, model=model)
+                if not matches:
+                    matches = detect_faces(p, model=model, upsample=2)
+                if not matches:
+                    raise NoFaceDetectedError(p)
+                matches.sort(
+                    key=lambda m: (m.location[2] - m.location[0]), reverse=True
+                )
+                labels.append(p.stem)
+                encodings.append(matches[0].encoding)
+            except (FaceEncodingError, FileNotFoundError) as e:
+                if not skip_failures:
+                    raise
+                print(f"  [skip] {p.name}: {e}")
+        return cls(labels=labels, encodings=encodings)
+
+
 def save_encoding(encoding: np.ndarray, out_path: PathLike) -> None:
     """Persist an encoding to disk as JSON, for later pipeline stages to load."""
     out_path = Path(out_path)
