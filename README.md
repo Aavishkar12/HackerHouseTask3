@@ -33,6 +33,7 @@ hh-goa-2026-pipeline/
 │       └── face_encode.py    # reusable, importable encoding + matching
 ├── scripts/
 │   ├── demo_encode.py        # CLI demo: encode one photo, save the result
+│   ├── scan_face.py          # LIVE webcam capture -> encode (the real input step)
 │   ├── build_gallery.py      # build a multi-photo reference gallery
 │   └── verify_stage1.py      # full self-check (9 integration checks)
 ├── tests/
@@ -77,12 +78,44 @@ angles, with and without glasses. Variety matters more than count.
 python scripts/demo_encode.py
 python scripts/demo_encode.py path/to/any/photo.jpg
 
+# capture a face scan LIVE from your webcam (needs a real display + camera)
+python scripts/scan_face.py
+python scripts/scan_face.py --countdown 3   # hands-free, for the screen recording
+
 # build the reference gallery (+ leave-one-out validation)
 python scripts/build_gallery.py
 
 # full self-check
 python scripts/verify_stage1.py
 ```
+
+### Live webcam capture
+
+`scripts/scan_face.py` is the actual "face scan input" step the task
+describes — the pipeline's real input is a live camera capture, not a
+photo picked from disk. It opens the default webcam, shows a live
+preview, and on `SPACE` (or after a `--countdown`, for a hands-free
+recording):
+
+1. saves the raw frame to `data/output/scan_<timestamp>.jpg`
+2. encodes it with the same `encode_face_from_array()` used everywhere
+   else in this module — no separate code path
+3. if `data/output/gallery.json` exists, matches it against the gallery
+   immediately and prints the distance and verdict, so you get a live
+   "yes, this is really you" check before recording continues
+
+This needs a real display and webcam attached to the machine it runs
+on — it will not work over SSH or in a headless/cloud environment.
+`ESC` quits without capturing. A bad or busy camera prints some noisy
+OpenCV/FFmpeg warnings before a clean error message — those warnings
+are harmless.
+
+Verified in development: passing a real photo through the same code
+path `scan_face.py` uses gave `distance=0.0000` against that photo's
+own file-based encoding (expected — identical pixels), and a non-face
+frame was rejected with no crash. The live-camera loop itself needs a
+physical webcam to test and could not be run in the environment this
+was built in — verify it once on your own machine before recording.
 
 Verified `verify_stage1.py` output on a real photo:
 
