@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -335,9 +335,26 @@ class FaceGallery:
 
     labels: List[str]
     encodings: List[np.ndarray]
+    # Original file each reference was built from. Stage 2 needs this: a
+    # freshly captured webcam frame has no web presence, so the reverse
+    # image search has to be run against an enrolled photo instead. Empty
+    # for galleries saved before this field existed.
+    sources: List[str] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.encodings)
+
+    def source_for(self, label: str) -> Optional[str]:
+        """
+        Path of the original image behind a reference label, or None if
+        this gallery predates source tracking / the label is unknown.
+        """
+        if not self.sources:
+            return None
+        try:
+            return self.sources[self.labels.index(label)]
+        except (ValueError, IndexError):
+            return None
 
     def match(
         self, candidate: np.ndarray, tolerance: float = DEFAULT_TOLERANCE
@@ -361,6 +378,7 @@ class FaceGallery:
             "metric": "cosine",
             "dim": EMBEDDING_DIM,
             "labels": self.labels,
+            "sources": self.sources,
             "encodings": [np.asarray(e).tolist() for e in self.encodings],
         }
         out_path.write_text(json.dumps(payload, indent=2))
@@ -379,6 +397,9 @@ class FaceGallery:
         return cls(
             labels=data["labels"],
             encodings=[np.array(e, dtype=np.float64) for e in data["encodings"]],
+            # Older galleries have no 'sources' key — that's fine, it just
+            # means Stage 2 can't auto-pick a search image.
+            sources=list(data.get("sources", [])),
         )
 
     @classmethod
@@ -396,7 +417,7 @@ class FaceGallery:
         skip_failures=True. For multi-face photos the largest face is
         used, assuming the subject is closest to the camera.
         """
-        labels, encodings = [], []
+        labels, encodings, sources = [], [], []
         for p in image_paths:
             p = Path(p)
             try:
@@ -410,11 +431,12 @@ class FaceGallery:
                 )
                 labels.append(p.stem)
                 encodings.append(matches[0].encoding)
+                sources.append(str(p))
             except (FaceEncodingError, FileNotFoundError) as e:
                 if not skip_failures:
                     raise
                 print(f"  [skip] {p.name}: {e}")
-        return cls(labels=labels, encodings=encodings)
+        return cls(labels=labels, encodings=encodings, sources=sources)
 
 
 def save_encoding(encoding: np.ndarray, out_path: PathLike) -> None:

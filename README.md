@@ -10,7 +10,7 @@ This repo is built in stages. This README grows as each stage lands.
 - [x] **Stage 1 — Face detection & encoding** — validated on 7 real
       photos; 14 unit tests + 9 integration checks passing
 - [x] **Stage 2 — Web/social search** — reverse image search, social
-      filtering, face re-verification; 27 unit tests passing
+      filtering, face re-verification; 32 unit tests passing
 - [ ] Stage 3 — Blockchain upload + re-verification
 
 ---
@@ -168,7 +168,7 @@ detected, no false positives, clean rejection.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/          # 41 tests (Stage 1 + Stage 2)
+pytest tests/          # 46 tests (Stage 1 + Stage 2)
 ```
 
 ---
@@ -308,14 +308,55 @@ results down to real social media posts, and re-verifies the face on the
 page it found.
 
 ```bash
-python scripts/find_match.py                      # uses latest webcam scan
-python scripts/find_match.py path/to/photo.jpg
+python scripts/find_match.py                      # uses newest webcam scan
+python scripts/find_match.py --scan path/to/scan.jpg
+python scripts/find_match.py --query-image path/to/indexed_photo.jpg
 python scripts/find_match.py --manual             # if automation is blocked
 python scripts/find_match.py --engine google
 ```
 
 Output: `data/output/match_record.json` — the canonical record Stage 3
 hashes and writes on-chain.
+
+### The scan and the search image are two different things
+
+This is the most important thing to understand about Stage 2.
+
+**A live webcam frame can never be found by a reverse image search**, because
+that exact image has never existed on the internet. That's a property of
+how reverse image search works — it matches *images*, not faces — not a
+limitation of this code. So the two images play different roles:
+
+| Image | Role |
+|---|---|
+| **scan image** | identifies *who* is in front of the camera, by matching against the enrolled gallery — this is the face-ID step |
+| **query image** | what actually gets searched for on the web — the enrolled reference photo of the person just identified |
+
+The flow is therefore:
+
+```
+webcam scan ──encode──> match against enrolled gallery ──> "this is <subject>"
+                                                              │
+                          enrolled reference photo of <subject>
+                                                              │
+                                                    reverse image search
+                                                              │
+                                    filter to social posts ──> verify face ──> hash
+```
+
+`find_match.py` picks the query image automatically: whichever enrolled
+photo the scan matched. Override it with `--query-image`.
+
+The search itself remains completely genuine — choosing *what to query
+with* is a design decision; hardcoding *the result* would be cheating,
+and nothing here does that. Whatever the engine returns is what gets
+filtered, verified and reported, and finding nothing is reported honestly.
+
+**Practical consequence:** the subject you enrol needs at least one photo
+that is actually indexed on the web, or the search will correctly find
+nothing. Most private individuals have none — LinkedIn serves profile
+photos from a CDN that image crawlers generally don't index, so even a
+public profile usually isn't searchable by image.
 
 ### Why browser automation instead of an API
 
@@ -409,8 +450,13 @@ machine. This is tested directly — see `tests/test_search.py`.
 
 - **Reverse image search finds the photo, not the person.** If the exact
   image (or a near-duplicate) has never been posted publicly, the search
-  legitimately returns nothing. Use a photo that is actually public — a
-  LinkedIn profile picture is usually the most reliably indexed.
+  legitimately returns nothing. This is the single biggest constraint on
+  the pipeline: **a subject with no web-indexed photo cannot be found by
+  any reverse image search, at any price, from any provider.** Tested
+  directly during development — a private individual's selfies and even
+  their public LinkedIn profile photo returned no matches, because
+  LinkedIn serves profile images from a CDN that image crawlers don't
+  index.
 - **Instagram Stories will never work** — they're ephemeral and have no
   public crawlable URL. It must be a feed post on a public account.
 - **Scraping is more fragile than an API.** Selectors are isolated in one

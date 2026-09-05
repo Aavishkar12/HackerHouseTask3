@@ -124,6 +124,9 @@ def _record(**overrides) -> MatchRecord:
         platform="Instagram",
         page_title="A post",
         candidate_image_url="https://cdn.example.com/i.jpg",
+        scan_image_sha256="b" * 64,
+        identified_subject="ref00_original",
+        identification_distance=0.21,
         face_verified=True,
         face_distance=0.34,
     )
@@ -208,3 +211,65 @@ def test_unicode_in_title_hashes_consistently():
     r2 = _record(page_title="Aavishkar 🎉 फोटो")
     assert r1.content_hash() == r2.content_hash()
     assert r1.content_hash() != _record(page_title="different").content_hash()
+
+
+# --- scan vs query separation (added when the pipeline split the two) ---
+
+def test_identification_is_part_of_the_hashed_claim():
+    """
+    Who the scan was identified as is part of what goes on-chain — if it
+    changes, the hash must change too.
+    """
+    assert _record(identified_subject="alice").content_hash() != \
+           _record(identified_subject="bob").content_hash()
+
+
+def test_scan_hash_is_part_of_the_claim():
+    assert _record(scan_image_sha256="c" * 64).content_hash() != \
+           _record(scan_image_sha256="d" * 64).content_hash()
+
+
+def test_unidentified_scan_still_produces_a_valid_record():
+    """
+    A scan that matches nobody is a legitimate outcome, not a crash — the
+    record just carries identified_subject=None.
+    """
+    rec = _record(identified_subject=None, identification_distance=None)
+    assert rec.content_hash()
+    assert rec.hashed_payload()["identified_subject"] is None
+
+
+def test_gallery_source_tracking_roundtrip(tmp_path):
+    """Stage 2 needs to recover the enrolled photo behind a match."""
+    import numpy as np
+    from faceid.face_encode import FaceGallery
+
+    g = FaceGallery(
+        labels=["ref00", "ref01"],
+        encodings=[np.random.rand(512), np.random.rand(512)],
+        sources=["data/refs/ref00.jpg", "data/refs/ref01.jpg"],
+    )
+    p = tmp_path / "g.json"
+    g.save(p)
+    loaded = FaceGallery.load(p)
+    assert loaded.sources == g.sources
+    assert loaded.source_for("ref01") == "data/refs/ref01.jpg"
+    assert loaded.source_for("nonexistent") is None
+
+
+def test_gallery_without_sources_still_loads(tmp_path):
+    """Galleries saved before source tracking existed must not break."""
+    import json
+    import numpy as np
+    from faceid.face_encode import FaceGallery, DEFAULT_MODEL
+
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({
+        "model": DEFAULT_MODEL,
+        "metric": "cosine",
+        "labels": ["ref00"],
+        "encodings": [np.random.rand(512).tolist()],
+    }))
+    g = FaceGallery.load(p)
+    assert g.sources == []
+    assert g.source_for("ref00") is None      # degrades, doesn't crash

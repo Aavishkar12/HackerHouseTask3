@@ -69,12 +69,21 @@ class MatchRecord:
     and whether the face actually checked out.
     """
 
-    # --- what we searched with ---
+    # --- required: what we searched with, and what we found ---
     query_image_path: str
     query_image_sha256: str
-
-    # --- what the search found ---
     post_url: str
+
+    # --- the face scan that triggered this, and who it was identified as ---
+    # The scan and the query image are usually DIFFERENT files. A live
+    # webcam frame identifies the subject against the enrolled gallery,
+    # but can't be searched for on the web (it has never been published),
+    # so the search runs against the enrolled reference photo instead.
+    scan_image_sha256: str = ""
+    identified_subject: Optional[str] = None
+    identification_distance: Optional[float] = None
+
+    # --- more about what the search found ---
     platform: Optional[str] = None
     page_title: str = ""
     candidate_image_url: str = ""
@@ -107,17 +116,24 @@ class MatchRecord:
         The subset of fields that constitute the tamper-evident claim.
 
         Excluded on purpose:
-          - discovered_at / query_image_path : run-specific, would break
-            reproducibility of the hash
-          - result counts and engine mode    : provenance, useful to keep
-            in the file but not part of "what was found"
+          - local file paths       : differ per machine, so including them
+            would make the same discovery hash differently elsewhere
+          - discovered_at          : the blockchain supplies its own,
+            trustworthy timestamp; ours would only be a claim
+          - result counts / engine : provenance worth keeping in the file,
+            but not part of "what was found"
 
-        Included: the post URL, the platform, the image hash we searched
-        with, and the face-verification outcome — i.e. exactly the claim
-        "this face was found at this URL, and here's how confident we are".
+        Included: the scan, who it was identified as, what was searched
+        with, what was found, and whether the face on the found page
+        actually checked out — i.e. the whole substantive claim:
+        "this scan was identified as X, and X's face was found at this
+        URL, with this much confidence".
         """
         return {
             "record_version": self.record_version,
+            "scan_image_sha256": self.scan_image_sha256,
+            "identified_subject": self.identified_subject,
+            "identification_distance": self.identification_distance,
             "query_image_sha256": self.query_image_sha256,
             "post_url": self.post_url,
             "platform": self.platform,
