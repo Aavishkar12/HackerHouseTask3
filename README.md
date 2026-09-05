@@ -358,6 +358,29 @@ nothing. Most private individuals have none — LinkedIn serves profile
 photos from a CDN that image crawlers generally don't index, so even a
 public profile usually isn't searchable by image.
 
+### One gallery = one person
+
+A `FaceGallery` represents a **single identity**. Putting two people's
+photos in the same reference folder produces a gallery that matches both,
+which silently makes identification meaningless and would let
+`verify_match` confirm the wrong person.
+
+Keep separate people in separate folders and separate gallery files:
+
+```bash
+# enrol subject A
+python scripts/build_gallery.py --refs-dir data/sample_images/subject_a \
+                               --out data/output/gallery_a.json
+
+# enrol subject B
+python scripts/build_gallery.py --refs-dir data/sample_images/subject_b \
+                               --out data/output/gallery_b.json
+
+# run the pipeline against whichever one you want
+python scripts/find_match.py --gallery data/output/gallery_a.json
+python scripts/scan_face.py  --gallery data/output/gallery_a.json
+```
+
 ### Why browser automation instead of an API
 
 The task allows the search step "via reverse image search, an API, or a

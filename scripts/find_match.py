@@ -116,6 +116,9 @@ def main() -> int:
     ap.add_argument("--query-image",
                     help="image to actually search the web with. Default: "
                          "the enrolled photo of whoever the scan matched.")
+    ap.add_argument("--gallery", default=str(GALLERY_PATH),
+                    help="gallery to identify against "
+                         f"(default: {GALLERY_PATH.name})")
     ap.add_argument("--engine", default="yandex", choices=["yandex", "google"])
     ap.add_argument("--manual", action="store_true",
                     help="open the browser and upload by hand, then scrape")
@@ -146,8 +149,9 @@ def main() -> int:
     identification_distance = None
     query_image: Path | None = None
 
-    if GALLERY_PATH.exists():
-        gallery = FaceGallery.load(GALLERY_PATH)
+    gallery_path = Path(args.gallery)
+    if gallery_path.exists():
+        gallery = FaceGallery.load(gallery_path)
         try:
             # A scan can legitimately catch more than one face — someone
             # walking past the camera, or a group photo held up to it. Use
@@ -188,7 +192,7 @@ def main() -> int:
             print("    Continuing, but the identification is unconfirmed — "
                   "this will be recorded honestly.")
     else:
-        print(f"[!] No gallery at {GALLERY_PATH} — cannot identify the scan.")
+        print(f"[!] No gallery at {gallery_path} — cannot identify the scan.")
         print("    Run scripts/build_gallery.py to enroll a subject first.")
 
     # Decide what actually gets searched for.

@@ -66,7 +66,7 @@ def try_import_cv2():
         sys.exit(1)
 
 
-def process_captured_frame(frame, cv2):
+def process_captured_frame(frame, cv2, gallery_path=None):
     """Save, encode, and (if a gallery exists) match the captured frame."""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,8 +91,9 @@ def process_captured_frame(frame, cv2):
     save_encoding(embedding, emb_path)
     print(f"[+] Saved embedding -> {emb_path}")
 
-    if GALLERY_PATH.exists():
-        gallery = FaceGallery.load(GALLERY_PATH)
+    gallery_path = Path(gallery_path) if gallery_path else GALLERY_PATH
+    if gallery_path.exists():
+        gallery = FaceGallery.load(gallery_path)
         is_match, distance, via = gallery.match(embedding)
         verdict = "MATCH" if is_match else "NO MATCH"
         print(f"\n[*] Checked against your {len(gallery)}-photo gallery:")
@@ -103,7 +104,7 @@ def process_captured_frame(frame, cv2):
             print("    (this scan would NOT be treated as you by Stage 2/3 — "
                   "recapture with better lighting/angle)")
     else:
-        print(f"\n[i] No gallery found at {GALLERY_PATH} — skipping match check.")
+        print(f"\n[i] No gallery found at {gallery_path} — skipping match check.")
         print("    Run scripts/build_gallery.py first if you want live "
               "self-verification during the scan.")
 
@@ -114,6 +115,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0,
                         help="camera index (default 0, the default webcam)")
+    parser.add_argument("--gallery", default=str(GALLERY_PATH),
+                        help="gallery to self-check the capture against")
     parser.add_argument("--countdown", type=int, default=0,
                         help="auto-capture after N seconds instead of "
                              "waiting for SPACE (useful for a hands-free "
@@ -146,7 +149,7 @@ def main():
             if countdown_start is not None:
                 remaining = args.countdown - (time.time() - countdown_start)
                 if remaining <= 0:
-                    process_captured_frame(frame, cv2)
+                    process_captured_frame(frame, cv2, args.gallery)
                     captured = True
                     break
                 cv2.putText(display, f"capturing in {remaining:.1f}s",
@@ -164,7 +167,7 @@ def main():
                 print("[*] Quit without capturing.")
                 break
             if key == 32 and countdown_start is None:  # SPACE
-                process_captured_frame(frame, cv2)
+                process_captured_frame(frame, cv2, args.gallery)
                 captured = True
                 break
     finally:

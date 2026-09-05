@@ -45,21 +45,40 @@ EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 def main() -> int:
-    if len(sys.argv) > 1:
-        paths = [Path(p) for p in sys.argv[1:]]
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Build a face gallery for ONE person from several photos.")
+    ap.add_argument("images", nargs="*",
+                    help="explicit photo paths (default: everything in --refs-dir)")
+    ap.add_argument("--refs-dir", default=str(REFS_DIR),
+                    help=f"folder of reference photos (default: {REFS_DIR})")
+    ap.add_argument("--out", default=str(OUT_PATH),
+                    help=f"where to write the gallery (default: {OUT_PATH})")
+    args = ap.parse_args()
+
+    refs_dir = Path(args.refs_dir)
+    out_path = Path(args.out)
+
+    if args.images:
+        paths = [Path(p) for p in args.images]
     else:
-        if not REFS_DIR.exists():
-            print(f"[!] No reference folder at {REFS_DIR}")
-            print("    Put several photos of the same person there, or pass "
+        if not refs_dir.exists():
+            print(f"[!] No reference folder at {refs_dir}")
+            print("    Put several photos of the SAME person there, or pass "
                   "paths as arguments.")
             return 1
-        paths = sorted(p for p in REFS_DIR.iterdir() if p.suffix.lower() in EXTS)
+        paths = sorted(p for p in refs_dir.iterdir() if p.suffix.lower() in EXTS)
 
     if not paths:
-        print(f"[!] No images found in {REFS_DIR}")
+        print(f"[!] No images found in {refs_dir}")
         return 1
 
-    print(f"[*] Building gallery from {len(paths)} photo(s)...")
+    # A gallery represents ONE identity. Mixing two people's photos would
+    # produce a gallery that matches both, silently making identification
+    # meaningless — so keep separate people in separate folders/files.
+    print(f"[*] Building gallery from {len(paths)} photo(s) in {refs_dir} ...")
+    print("    (all of these must be the SAME person)")
     gallery = FaceGallery.from_paths(paths)
 
     if len(gallery) == 0:
@@ -70,8 +89,8 @@ def main() -> int:
               "is strongly recommended; fewer leaves the match threshold "
               "poorly constrained.")
 
-    gallery.save(OUT_PATH)
-    print(f"[+] Gallery with {len(gallery)} reference(s) -> {OUT_PATH}")
+    gallery.save(out_path)
+    print(f"[+] Gallery with {len(gallery)} reference(s) -> {out_path}")
     for label in gallery.labels:
         print(f"      - {label}")
 
