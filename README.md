@@ -9,7 +9,8 @@ This repo is built in stages. This README grows as each stage lands.
 
 - [x] **Stage 1 — Face detection & encoding** — validated on 7 real
       photos; 14 unit tests + 9 integration checks passing
-- [ ] Stage 2 — Web/social media search for a matching post
+- [x] **Stage 2 — Web/social search** — reverse image search, social
+      filtering, face re-verification; 27 unit tests passing
 - [ ] Stage 3 — Blockchain upload + re-verification
 
 ---
@@ -28,16 +29,25 @@ hh-goa-2026-pipeline/
 ├── requirements-dev.txt      # + pytest
 ├── .env.example              # credential template (copy to .env)
 ├── src/
-│   └── faceid/
+│   ├── faceid/
+│   │   ├── __init__.py
+│   │   └── face_encode.py    # Stage 1: encoding + gallery matching
+│   └── search/
 │       ├── __init__.py
-│       └── face_encode.py    # reusable, importable encoding + matching
+│       ├── reverse_search.py # Stage 2: browser-driven reverse image search
+│       ├── social_filter.py  # Stage 2: classify/rank social results
+│       ├── verify_match.py   # Stage 2: re-verify the face on the found page
+│       └── record.py         # Stage 2->3 canonical record + hashing
 ├── scripts/
 │   ├── demo_encode.py        # CLI demo: encode one photo, save the result
 │   ├── scan_face.py          # LIVE webcam capture -> encode (the real input step)
 │   ├── build_gallery.py      # build a multi-photo reference gallery
-│   └── verify_stage1.py      # full self-check (9 integration checks)
+│   ├── verify_stage1.py      # full self-check (9 integration checks)
+│   └── find_match.py         # Stage 2: search -> filter -> verify -> record
 ├── tests/
-│   └── test_face_encode.py   # unit tests
+│   ├── test_face_encode.py   # Stage 1 unit tests
+│   ├── test_search.py        # Stage 2 unit tests
+│   └── fixtures/             # saved HTML for offline parser tests
 └── data/
     ├── sample_images/        # your photos (git-ignored)
     │   └── refs/             # gallery reference photos
@@ -158,7 +168,7 @@ detected, no false positives, clean rejection.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/          # 14 tests
+pytest tests/          # 41 tests (Stage 1 + Stage 2)
 ```
 
 ---
@@ -289,13 +299,136 @@ model, since embeddings from different models are not comparable.
 - Uses the `retinaface` detector (most accurate DeepFace offers). Swap
   to `opencv` via `detector_backend=` for speed at some accuracy cost.
 
-## Stages 2 & 3 (to follow)
+---
 
-- **Stage 2:** use the face gallery to run a genuine reverse-image / web
-  search (Google Cloud Vision web detection) and find a real matching
-  social media post.
-- **Stage 3:** hash the discovered post and write it to a blockchain,
-  then demonstrate re-verification against the on-chain record.
+## Stage 2: Web / social media search
+
+Takes the face scan, runs a **genuine reverse image search**, filters the
+results down to real social media posts, and re-verifies the face on the
+page it found.
+
+```bash
+python scripts/find_match.py                      # uses latest webcam scan
+python scripts/find_match.py path/to/photo.jpg
+python scripts/find_match.py --manual             # if automation is blocked
+python scripts/find_match.py --engine google
+```
+
+Output: `data/output/match_record.json` — the canonical record Stage 3
+hashes and writes on-chain.
+
+### Why browser automation instead of an API
+
+The task allows the search step "via reverse image search, an API, or a
+scripted search approach". Every hosted reverse-image API was gated
+behind payment or identity verification:
+
+| Service | Blocker |
+|---|---|
+| Google Cloud Vision | billing account + card deposit required |
+| SerpApi | phone verification (failed across 5 numbers) |
+| TinEye | no free tier at all — search bundles must be purchased |
+
+So this uses the scripted approach the spec explicitly permits: Playwright
+drives a real browser through a real reverse image search and parses the
+real results page. **Nothing is hardcoded** — the URLs reported are
+whatever the engine actually returns.
+
+**Yandex is the default engine**, not Google, because its image index is
+markedly better at matching *faces* across the web — which is precisely
+this pipeline's use case. Google is supported via `--engine google` but
+blocks automation far more aggressively.
+
+### Manual mode
+
+Search engines change their DOM and deploy bot-detection without notice.
+`--manual` opens the browser at the search page, you do the upload by
+hand, press Enter, and the script scrapes whatever results page is open.
+
+This still satisfies "a scripted search approach" — the script performs
+the parsing, filtering and verification on real live results. It exists
+so that a DOM change the day before a deadline degrades the demo rather
+than breaking it. It works with **any** engine, because it falls back to
+generic outbound-link extraction.
+
+### Three steps, and what each guarantees
+
+1. **Reverse image search** (`src/search/reverse_search.py`) — real
+   browser, real search, real results. Engine-specific parsing with a
+   generic fallback so a DOM change degrades quality instead of failing.
+2. **Social filtering** (`src/search/social_filter.py`) — a reverse
+   image search returns every page hosting the image: news sites,
+   scrapers, CDNs. This classifies results by platform and ranks genuine
+   social posts above aggregators like Pinterest (which are usually
+   re-pins of someone else's upload, not the original).
+3. **Face re-verification** (`src/search/verify_match.py`) — the search
+   engine found a *visually similar* image, which is not the same claim
+   as "this page shows the person we scanned". This downloads the
+   candidate image and runs it back through Stage 1's gallery, producing
+   a measured cosine distance rather than trusting the engine.
+
+Step 3 matters because Stage 3 writes the result to a blockchain
+permanently. A wrong match is not recoverable, so the standard for "this
+is really them" is evidence, not the search engine's word.
+
+### The hand-off record
+
+`match_record.json` separates the **hashed payload** (what was found)
+from **metadata** (when it was found, local file paths, result counts):
+
+```json
+{
+  "content_hash": "dcbc61c9...",
+  "hashed_payload": {
+    "post_url": "https://www.instagram.com/p/...",
+    "platform": "Instagram",
+    "query_image_sha256": "1ea08c5f...",
+    "face_verified": true,
+    "face_distance": 0.0
+  },
+  "discovered_at": "2026-09-05T21:37:54+00:00"
+}
+```
+
+Timestamps and local paths are deliberately **excluded from the hash**.
+If they were included, re-running verification tomorrow would produce a
+different hash and the on-chain check would fail even though nothing was
+tampered with. Serialisation is canonical (sorted keys, fixed separators,
+UTF-8), so the same discovery always produces identical bytes on any
+machine. This is tested directly — see `tests/test_search.py`.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Found a social media post |
+| 1 | Search failed (no image, browser error, engine blocked) |
+| 2 | Search succeeded but found no social post — a real result, not a bug |
+
+### Known limitations (Stage 2)
+
+- **Reverse image search finds the photo, not the person.** If the exact
+  image (or a near-duplicate) has never been posted publicly, the search
+  legitimately returns nothing. Use a photo that is actually public — a
+  LinkedIn profile picture is usually the most reliably indexed.
+- **Instagram Stories will never work** — they're ephemeral and have no
+  public crawlable URL. It must be a feed post on a public account.
+- **Scraping is more fragile than an API.** Selectors are isolated in one
+  place and there is a generic fallback plus manual mode, but a
+  sufficiently large redesign will need the selectors updated.
+- **Hotlink blocking limits verification.** Most social platforms block
+  direct image fetches, so face re-verification often can't run on the
+  final post; the record records that honestly (`attempted: false`)
+  rather than claiming a verification that didn't happen.
+- **Requires live internet**, unlike Stage 1 which is fully offline once
+  model weights are cached.
+
+---
+
+## Stage 3 (to follow)
+
+Hash the discovered post (`content_hash` above) and write it to a
+blockchain, then demonstrate re-verification against the on-chain record.
 
 Credentials go in `.env` (see `.env.example`). `.env`, service-account
 JSONs and `*-key.json` are git-ignored — never commit real keys.

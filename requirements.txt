@@ -11,3 +11,9 @@ retina-face==0.0.18
 numpy==2.4.6
 Pillow==12.3.0
 opencv-python==5.0.0.93
+
+# Stage 2: reverse image search via browser automation
+# After installing, you must also download the browser binary:
+#     playwright install chromium
+playwright==1.62.0
+requests==2.34.2
