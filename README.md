@@ -3,7 +3,20 @@
 Pipeline shape: **face scan → web/social search for a matching post →
 blockchain upload & re-verification of the discovered data.**
 
-This repo is built in stages. This README grows as each stage lands.
+## What this does
+
+1. **Scans a face** from a live webcam and encodes it as a 512-dimensional
+   ArcFace embedding, then identifies it against an enrolled gallery.
+2. **Searches the web** with a genuine reverse image search (browser
+   automation against Yandex/Google — nothing hardcoded), filters the
+   results down to real social media posts, and re-verifies the face on
+   the page it found.
+3. **Anchors the discovery on a blockchain** as a SHA-256 fingerprint,
+   then re-verifies it by recomputing that hash and looking it up on
+   chain — proving the record hasn't been altered since.
+
+Finding nothing is a real, reported outcome at every stage. Nothing in
+this pipeline fabricates a match.
 
 ## Status
 
@@ -11,7 +24,11 @@ This repo is built in stages. This README grows as each stage lands.
       photos; 14 unit tests + 9 integration checks passing
 - [x] **Stage 2 — Web/social search** — reverse image search, social
       filtering, face re-verification; 32 unit tests passing
-- [ ] Stage 3 — Blockchain upload + re-verification
+- [x] **Stage 3 — Blockchain anchoring & verification** — Solidity
+      contract on an EVM chain, tamper detection demonstrated; 33 unit
+      tests passing against a real in-process EVM
+
+**Quick start:** [Running the whole pipeline end to end](#running-the-whole-pipeline-end-to-end)
 
 ---
 
@@ -27,35 +44,47 @@ model** and RetinaFace for detection.
 hh-goa-2026-pipeline/
 ├── requirements.txt          # pinned runtime deps
 ├── requirements-dev.txt      # + pytest
-├── .env.example              # credential template (copy to .env)
+├── .env.example              # only needed for a public testnet (Stage 3)
+├── contracts/
+│   ├── MatchRegistry.sol     # Stage 3: the contract (90 lines)
+│   └── MatchRegistry.json    # precompiled ABI + bytecode (no solc needed)
 ├── src/
 │   ├── faceid/
 │   │   ├── __init__.py
 │   │   └── face_encode.py    # Stage 1: encoding + gallery matching
-│   └── search/
+│   ├── search/
+│   │   ├── __init__.py
+│   │   ├── reverse_search.py # Stage 2: browser-driven reverse image search
+│   │   ├── social_filter.py  # Stage 2: classify/rank social results
+│   │   ├── verify_match.py   # Stage 2: re-verify the face on the found page
+│   │   └── record.py         # Stage 2->3 canonical record + hashing
+│   └── chain/
 │       ├── __init__.py
-│       ├── reverse_search.py # Stage 2: browser-driven reverse image search
-│       ├── social_filter.py  # Stage 2: classify/rank social results
-│       ├── verify_match.py   # Stage 2: re-verify the face on the found page
-│       └── record.py         # Stage 2->3 canonical record + hashing
+│       └── registry.py       # Stage 3: connect / deploy / anchor / verify
 ├── scripts/
 │   ├── demo_encode.py        # CLI demo: encode one photo, save the result
 │   ├── scan_face.py          # LIVE webcam capture -> encode (the real input step)
 │   ├── build_gallery.py      # build a multi-photo reference gallery
 │   ├── verify_stage1.py      # full self-check (9 integration checks)
-│   └── find_match.py         # Stage 2: search -> filter -> verify -> record
+│   ├── find_match.py         # Stage 2: search -> filter -> verify -> record
+│   ├── deploy_contract.py    # Stage 3: deploy MatchRegistry
+│   ├── anchor_record.py      # Stage 3: hash the record, write it on chain
+│   ├── verify_onchain.py     # Stage 3: recompute + verify (+ --tamper proof)
+│   └── compile_contract.py   # optional: rebuild the artifact from the .sol
 ├── tests/
 │   ├── test_face_encode.py   # Stage 1 unit tests
 │   ├── test_search.py        # Stage 2 unit tests
+│   ├── test_chain.py         # Stage 3 unit tests (real in-process EVM)
 │   └── fixtures/             # saved HTML for offline parser tests
 └── data/
     ├── sample_images/        # your photos (git-ignored)
     │   └── refs/             # gallery reference photos
-    └── output/               # embeddings + gallery land here (git-ignored)
+    └── output/               # embeddings, gallery, records (git-ignored)
 ```
 
-Stages 2 and 3 import from `src/faceid/face_encode.py` rather than
-duplicating detection or matching logic.
+Each stage imports from the one before rather than duplicating logic:
+Stage 2 and Stage 3 both use `src/faceid/face_encode.py` for detection and
+matching, and Stage 3 hashes exactly the record Stage 2 wrote.
 
 ### Setup
 
@@ -66,10 +95,19 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+Stage 2 also needs a browser binary, and Stage 3 optionally needs a local
+chain:
+
+```bash
+playwright install chromium      # Stage 2
+npm install -g ganache           # Stage 3, only for the local-node mode
+```
+
 **Install notes:** DeepFace pulls in TensorFlow, so the install is large
 (~2.5GB virtualenv). On first run it downloads ~335MB of model weights
 to `~/.deepface/weights/` — the first encode takes ~15s, subsequent ones
-~3.7s per image on CPU. No compiler or CMake needed (unlike dlib).
+~3.7s per image on CPU. No compiler or CMake needed (unlike dlib), and no
+Solidity compiler either — the contract ships precompiled.
 
 ### Add your photos
 
@@ -494,10 +532,265 @@ machine. This is tested directly — see `tests/test_search.py`.
 
 ---
 
-## Stage 3 (to follow)
+## Stage 3: Blockchain upload & verification
 
-Hash the discovered post (`content_hash` above) and write it to a
-blockchain, then demonstrate re-verification against the on-chain record.
+Takes the `content_hash` from Stage 2, writes it to a blockchain, and
+then proves — later, from the chain alone — that the match record has not
+changed since.
 
-Credentials go in `.env` (see `.env.example`). `.env`, service-account
-JSONs and `*-key.json` are git-ignored — never commit real keys.
+### Which blockchain
+
+Any EVM chain that speaks JSON-RPC. Three ways to run it, in descending
+order of "how impressive it looks" and ascending order of "how easily it
+can go wrong on the day":
+
+| Mode | What it is | Needs | Persistent? |
+|---|---|---|---|
+| **Local node** (default) | Ganache / Anvil / Hardhat on `localhost:8545` | Node.js | Yes, until you stop it |
+| **Public testnet** | Sepolia or Polygon Amoy | Testnet funds from a faucet | Yes, forever, publicly |
+| **Simulated** | in-process EVM (`eth-tester` + `py-evm`) | nothing | No — dies with the process |
+
+All three run **the same compiled contract and the same code path**. The
+demo recording uses a local Ganache node: it is a real EVM executing real
+transactions, it survives between the anchor step and the verify step
+(which is what makes the two-step proof meaningful), and it can't fail
+because a faucet was dry or an RPC endpoint was rate-limiting.
+
+Simulated mode exists so the project runs on a machine with nothing
+installed. It is honest about what it is — it prints
+`in-process simulated chain` and refuses to pretend otherwise.
+
+Mainnet chains are **refused by default** (`MAINNET_CHAIN_IDS` in
+`src/chain/registry.py`); a prototype has no business spending real money.
+
+### The contract
+
+`contracts/MatchRegistry.sol` — 90 lines, three functions.
+
+```solidity
+function anchor(bytes32 contentHash) external;
+function verify(bytes32 contentHash) external view
+    returns (bool exists, uint256 timestamp, address submitter);
+function total() external view returns (uint256);
+```
+
+It stores a `bytes32` fingerprint, the block timestamp, and the submitting
+address. That is all.
+
+**No personal data ever goes on chain** — no image, no URL, no name, no
+face embedding. This is deliberate, not an oversight: a blockchain is
+permanent and public, so putting a real person's identifying data on one
+would be irreversible. A hash gives the full tamper-evidence guarantee
+with none of that exposure.
+
+Re-anchoring the same hash **reverts** rather than overwriting, so the
+first anchor timestamp is immutable. The Python layer treats that as
+success rather than an error, since the original record still stands.
+
+The compiled ABI and bytecode are committed at
+`contracts/MatchRegistry.json` (solc 0.8.24, optimizer on, 200 runs), so
+**no Solidity toolchain is needed to run this project**. Only run
+`scripts/compile_contract.py` if you change the `.sol`.
+
+### Setup
+
+Everything comes from `requirements.txt`. For the local-node mode you
+also need a chain to talk to:
+
+```bash
+# one-time, if you don't have it
+npm install -g ganache
+
+# leave this running in its own terminal for the whole demo
+npx ganache --wallet.deterministic
+```
+
+`--wallet.deterministic` gives the same funded test accounts every time,
+which makes a recording reproducible.
+
+No `.env` is needed for a local node — the dev node's first unlocked
+account signs, and no key is involved. `.env` is only for a public
+testnet:
+
+```
+RPC_URL=https://rpc-amoy.polygon.technology
+PRIVATE_KEY=0x...        # a TESTNET key, funded from a faucet
+```
+
+`.env` is git-ignored. Never put a key with real funds in it.
+
+### Run
+
+```bash
+# 1. deploy the contract (once per chain)
+python scripts/deploy_contract.py
+
+# 2. anchor the Stage 2 match record
+python scripts/anchor_record.py
+
+# 3. verify it against the chain — and prove tampering is caught
+python scripts/verify_onchain.py --tamper
+```
+
+The contract address is written to `data/output/deployment.json` and
+picked up automatically, so there is nothing to copy-paste between steps.
+
+Self-contained run with no node installed at all:
+
+```bash
+python scripts/anchor_record.py --simulated
+```
+
+That deploys, anchors, verifies and runs the tamper check inside one
+process, because the chain cannot outlive it.
+
+### How verification actually proves something
+
+The important detail is that **the hash is recomputed, never read back**:
+
+```
+match_record.json
+   -> hashed_payload()        (substantive fields only)
+   -> canonical JSON          (sorted keys, fixed separators, UTF-8)
+   -> SHA-256                 -> 0x47b6eee5...
+   -> MatchRegistry.verify()  -> found? when? by whom?
+```
+
+`verify_onchain.py` takes only the *contract address* from the receipt
+file. Every byte of the hash is derived from the record on disk at the
+moment you run it. So:
+
+- **Present on chain** → the record is byte-for-byte what was anchored.
+- **Absent** → either it was never anchored, or a hashed field changed.
+
+If the hash were read from the receipt instead of recomputed, the whole
+exercise would prove nothing — the receipt could just be edited too.
+
+### Tamper demonstration
+
+`--tamper` changes exactly one character of `post_url` in memory and looks
+the result up again:
+
+```
+original hash : 47b6eee5c5d0c3709a8226173c2c7006b32d8f6e1e083e58cad5898a7e9ed192
+edited   hash : c64b9d97bd7f677150615089c84d6feece900a07f494d15823de870d0a0489da
+
+[*] On-chain lookup of the edited record: NOT ON CHAIN
+[+] Tamper detected.
+```
+
+Editing `data/output/match_record.json` on disk and re-running
+`verify_onchain.py` produces the same outcome with exit code 2 — verified
+during development, not just asserted here.
+
+### What is and isn't in the hash
+
+| In the hash (substantive claims) | Excluded (volatile) |
+|---|---|
+| `post_url`, `platform`, `page_title` | `discovered_at` timestamp |
+| `candidate_image_url` | local file paths |
+| `query_image_sha256`, `scan_image_sha256` | result counts |
+| `identified_subject`, `identification_distance` | search engine / mode |
+| `face_verified`, `face_distance` | |
+
+Volatile fields are excluded so that re-saving the record on another
+machine, at another time, from another folder still verifies. Substantive
+fields are included so that changing *what was claimed* always breaks
+verification. Both halves of that are covered by tests
+(`test_volatile_fields_do_not_change_the_anchor`,
+`test_tampering_with_a_record_breaks_verification`).
+
+### Exit codes (Stage 3)
+
+| Code | `verify_onchain.py` meaning |
+|---|---|
+| 0 | Verified on chain |
+| 1 | Could not run — no node, no contract, no record, bad hash |
+| 2 | Ran fine, record is **not** on chain (tampered, or never anchored) |
+
+### Known limitations (Stage 3)
+
+- **A local chain proves integrity, not public notarisation.** Anchoring
+  to a node you control shows the mechanism works; it does not give the
+  independent third-party timestamp that a public chain would. Pointing
+  `RPC_URL` at Sepolia or Polygon Amoy gives that, with no code change —
+  the only reason the demo doesn't is faucet/RPC reliability on the day.
+- **Local nodes forget everything on restart.** Restart Ganache and the
+  contract is gone; you must redeploy and re-anchor. The error message
+  says so explicitly when it happens.
+- **The chain proves the record didn't change — not that it was true.**
+  If Stage 2 found the wrong post, Stage 3 will faithfully anchor that
+  wrong post forever. Blockchain gives integrity, not correctness. This
+  is a property of the technique, not a bug in this implementation.
+- **Anchoring is public.** On a public chain the hash, timestamp and
+  submitting address are visible to everyone. The hash reveals nothing
+  about its input, but the *fact and time* of an anchoring is exposed.
+- **Gas costs are real on a public chain** (~112k gas per anchor,
+  ~200k to deploy). Negligible on a testnet, not free on mainnet — which
+  is one more reason mainnet is refused by default.
+- **No access control.** Anyone can anchor any hash to a deployed
+  contract. For this prototype that's fine — the contract is a public
+  timestamping service, and the `submitter` address records who did it.
+  A production version would want an allowlist or a signature scheme.
+
+---
+
+## Running the whole pipeline end to end
+
+Two terminals. The first just holds the chain:
+
+```bash
+# terminal 1 — leave running
+npx ganache --wallet.deterministic
+```
+
+```bash
+# terminal 2
+source .venv/bin/activate            # Windows: .\.venv\Scripts\Activate.ps1
+
+# Stage 1 — enrol the subject (once)
+python scripts/build_gallery.py --refs-dir data/sample_images/public_figure \
+                                --out data/output/gallery_public_figure.json
+
+# Stage 1 — live face scan from the webcam
+python scripts/scan_face.py --gallery data/output/gallery_public_figure.json
+
+# Stage 2 — identify, search, filter, verify
+python scripts/find_match.py --gallery data/output/gallery_public_figure.json
+
+# Stage 3 — anchor and verify on chain
+python scripts/deploy_contract.py
+python scripts/anchor_record.py
+python scripts/verify_onchain.py --tamper
+```
+
+### Suggested recording order
+
+1. `npx ganache` in a visible terminal — the chain is real and running.
+2. `scan_face.py` — webcam opens, capture the subject, gallery match prints.
+3. `find_match.py` — browser opens, the search actually happens, a real
+   post is found and ranked, the record hash is printed.
+4. `deploy_contract.py` → `anchor_record.py` — transaction hash, block
+   number, gas used.
+5. `verify_onchain.py --tamper` — verified, then the tamper check fails
+   the edited record. **This is the moment that proves the whole thing.**
+6. Optional, and worth including: run `find_match.py` against a face with
+   no web presence and let it exit 2. Showing the system reporting "found
+   nothing" is stronger evidence that it isn't faking results than any
+   number of successful runs.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -q
+```
+
+| Suite | Covers |
+|---|---|
+| `test_face_encode.py` | Stage 1 encoding, distances, gallery matching |
+| `test_search.py` | Stage 2 domain handling, ranking, canonical hashing |
+| `test_chain.py` | Stage 3 against a real in-process EVM |
+
+Stage 3's tests run against an actual EVM rather than a mock — a mocked
+chain would happily "verify" anything and prove nothing.

@@ -17,3 +17,16 @@ opencv-python==5.0.0.93
 #     playwright install chromium
 playwright==1.62.0
 requests==2.34.2
+
+# Stage 3: blockchain anchoring & verification
+#
+# web3 talks JSON-RPC to any chain: a local Ganache/Anvil/Hardhat node,
+# or a public testnet (Sepolia, Polygon Amoy).
+#
+# The [tester] extra adds an in-process EVM (eth-tester + py-evm) so
+# Stage 3 can run with NO node installed at all — used by
+# `anchor_record.py --simulated` and by tests/test_chain.py.
+#
+# No Solidity compiler is needed: contracts/MatchRegistry.json ships
+# precompiled. Only run scripts/compile_contract.py if you edit the .sol.
+web3[tester]==8.0.0

@@ -19,3 +19,5 @@ data/output/*
 data/sample_images/*
 !data/sample_images/.gitkeep
 !data/sample_images/README.md
+node_modules/
+package-lock.json
