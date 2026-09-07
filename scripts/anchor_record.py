@@ -103,8 +103,23 @@ def main() -> int:
 
     print(f"[*] Record   : {record_path}")
     print(f"    subject  : {record.identified_subject or 'UNKNOWN'}")
-    print(f"    post     : {record.post_url}")
-    print(f"    platform : {record.platform}")
+    if record.social_post_found:
+        print(f"    post     : {record.post_url}")
+        print(f"    platform : {record.platform}")
+        if len(record.platforms_found) > 1:
+            print(f"    also on  : {', '.join(record.platforms_found)} "
+                  f"({len(record.canonical_social_results())} posts)")
+    else:
+        print("    post     : NONE — no social media post was found")
+        sources = record.canonical_web_sources()
+        if sources:
+            print(f"    but found on {len(sources)} attributable web "
+                  "source(s):")
+            for s in sources[:5]:
+                print(f"      - [{s['source']}] {s['url'][:70]}")
+        print("    (anchoring a negative finding is still worth doing: it "
+              "proves the\n     search really did come back empty, and was "
+              "not edited afterwards)")
     print(f"    face ok  : {record.face_verified}")
     print(f"\n[*] Canonical payload actually hashed:")
     for k, v in record.hashed_payload().items():

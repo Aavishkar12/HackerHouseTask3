@@ -237,29 +237,99 @@ def main() -> int:
     banner("STEP 3/4", "filter for social media posts")
     ranked = rank_results(r.to_dict() for r in raw_results)
     social = [r for r in ranked if r.is_social]
-    print(f"[*] {len(ranked)} unique page(s); {len(social)} on social platforms.")
+    web_srcs = [r for r in ranked if r.is_web_source]
+    print(f"[*] {len(ranked)} unique page(s); {len(social)} on social "
+          f"platforms; {len(web_srcs)} on attributable web sources.")
 
     if ranked:
         print("\n    Top results:")
         for i, r in enumerate(ranked[:args.top], 1):
             mark = "*" if r.is_social else " "
-            print(f"    {mark} {i:2}. [{r.platform or r.domain}] "
-                  f"{(r.title or r.url)[:68]}")
+            label = r.platform or r.domain
+            if r.via_cdn:
+                label += " via CDN"
+            print(f"    {mark} {i:2}. [{label}] {(r.title or r.url)[:64]}")
             print(f"           {r.url[:96]}")
+            if r.cdn_url:
+                print(f"           (post URL recovered from {r.domain} CDN link)")
 
     if not social:
-        print("\n[!] No social media post found for this image.")
-        print("    This is a real result, not a bug: the image isn't indexed "
-              "on any social platform the engine can see.")
-        print("    Use a photo that IS public online, or try --engine google "
-              "/ --manual.")
+        print("\n[!] No SOCIAL MEDIA post found for this image.")
+        if web_srcs:
+            # The image is demonstrably online — saying otherwise would be
+            # false. Report exactly what was found and where.
+            print(f"    The image WAS found online, on "
+                  f"{len(web_srcs)} attributable source(s):")
+            for r in web_srcs[: args.top]:
+                print(f"      - [{r.web_source}] {r.url}")
+            print("    These are real, checkable matches — but Wikimedia and "
+                  "the like are\n    not social media, so they do not satisfy "
+                  "Stage 2's requirement.")
+        elif ranked:
+            print(f"    The image was found on {len(ranked)} page(s), but "
+                  "none of them are\n    social platforms or attributable "
+                  "sources — mostly news sites and\n    image scrapers, which "
+                  "carry no author to verify against.")
+        else:
+            print("    The search returned nothing at all: this image does "
+                  "not appear to be\n    indexed anywhere the engine can see.")
+
+        print("\n    To get a social hit, search with an image that was "
+              "actually POSTED to\n    a social platform, rather than a press "
+              "or encyclopedia photo. Or try\n    --engine google, or "
+              "--manual to drive the search by hand.")
+
+        # Still record the finding. "Image is public at these locations, no
+        # social post" is a real, anchorable result, and Stage 3 should be
+        # able to demonstrate on it.
+        record = MatchRecord(
+            query_image_path=str(query_image),
+            query_image_sha256=query_hash,
+            scan_image_sha256=scan_hash,
+            identified_subject=identified_subject,
+            identification_distance=identification_distance,
+            post_url=web_srcs[0].url if web_srcs else "",
+            platform=None,
+            page_title=web_srcs[0].title if web_srcs else "",
+            social_post_found=False,
+            web_sources=[{"url": r.url, "source": r.web_source}
+                         for r in web_srcs],
+            search_engine=args.engine,
+            search_mode="manual" if args.manual else "automatic",
+            total_results_found=len(ranked),
+            social_results_found=0,
+            verification_note="no social media post found; "
+                              f"{len(web_srcs)} attributable web source(s)",
+        )
+        record.save(RECORD_PATH)
+        print(f"\n[+] Recorded the outcome anyway -> {RECORD_PATH}")
+        print(f"    Content hash: {record.content_hash()}")
+        print("    Stage 3 can anchor this: 'no social post found' is a real "
+              "finding,\n    and anchoring it proves it wasn't quietly "
+              "rewritten later.")
         return 2
 
     # -------------------------------------------------------------- 4. VERIFY
     best = social[0]
     banner("STEP 4/4", "verify the face on the page we found")
+
+    platforms = sorted({r.platform for r in social if r.platform})
+    if len(platforms) > 1:
+        print(f"[*] Found on {len(platforms)} platforms: "
+              f"{', '.join(platforms)}")
+        print("    All of them are recorded; the highest-ranked one is "
+              "verified below.")
     print(f"[*] Best social result: {best.summary}")
     print(f"    {best.url}")
+    if best.via_cdn:
+        if best.cdn_url:
+            print(f"    Identified from a {best.platform} CDN image; the post "
+                  "URL above was\n    reconstructed from it and is exact.")
+        else:
+            print(f"    Identified from a {best.platform} CDN image. The "
+                  "platform is certain,\n    but the specific post URL is not "
+                  "recoverable from a CDN link — the\n    URL above is the "
+                  "image itself, recorded honestly as such.")
 
     verification = FaceVerification(note="verification skipped (--no-verify)")
     if not args.no_verify:
@@ -268,7 +338,9 @@ def main() -> int:
                 note="no gallery available to verify against")
             print(f"[!] {verification.note}")
         else:
-            target = best.thumbnail_url or best.url
+            # A CDN link IS the matched image, so it is the best thing to
+            # re-encode: no hotlink block, no HTML page to scrape.
+            target = best.cdn_url or best.thumbnail_url or best.url
             print(f"[*] Re-encoding the candidate image against the "
                   f"{len(gallery)}-photo gallery ...")
             verification = verify_image_against_gallery(
@@ -293,6 +365,14 @@ def main() -> int:
         platform=best.platform,
         page_title=best.title,
         candidate_image_url=best.thumbnail_url,
+        platform_via_cdn=best.via_cdn,
+        source_cdn_url=best.cdn_url,
+        social_post_found=True,
+        all_social_results=[
+            {"url": r.url, "platform": r.platform, "via_cdn": r.via_cdn}
+            for r in social
+        ],
+        web_sources=[{"url": r.url, "source": r.web_source} for r in web_srcs],
         search_engine=args.engine,
         search_mode="manual" if args.manual else "automatic",
         total_results_found=len(ranked),
@@ -312,6 +392,10 @@ def main() -> int:
              if identification_distance is not None else ""))
     print(f"  Post found   : {record.post_url}")
     print(f"  Platform     : {record.platform}")
+    if len(record.platforms_found) > 1:
+        print(f"  Also found on: "
+              f"{', '.join(p for p in record.platforms_found if p != record.platform)}"
+              f"  ({len(record.canonical_social_results())} posts total)")
     print(f"  Face on page : {verification.summary}")
     print(f"  Content hash : {record.content_hash()}")
     print(f"\n[+] Saved -> {RECORD_PATH}")

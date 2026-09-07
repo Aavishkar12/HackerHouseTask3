@@ -27,9 +27,21 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-RECORD_VERSION = "stage2-match-record/v1"
+# Version history (each bump changes the hashed payload, so hashes across
+# versions are not comparable — intended, since they assert different
+# things). The version lives INSIDE the hashed payload and is read back
+# from the file, so a record saved under an older version still hashes as
+# that version and still verifies against its original anchor.
+#   v1  original
+#   v2  + all_social_results
+#   v3  + social_post_found, web_sources
+RECORD_VERSION = "stage2-match-record/v3"
+
+# Cap on how many social hits go into the record. A broad search can
+# return dozens; the record is evidence, not a crawl dump.
+MAX_SOCIAL_RESULTS = 25
 
 
 def sha256_file(path: str | Path) -> str:
@@ -101,7 +113,32 @@ class MatchRecord:
     matched_reference: Optional[str] = None
     verification_note: str = ""
 
+    # --- every social platform the search surfaced, not just the best ---
+    # "found on YouTube and Pinterest" is a stronger, more complete claim
+    # than "found on YouTube", so this IS hashed (see hashed_payload).
+    # Each entry: {"url": ..., "platform": ..., "via_cdn": bool}.
+    all_social_results: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Whether a genuine SOCIAL post was found. False means the image was
+    # located online but not on a social platform — a real, honest outcome
+    # that must be distinguishable from "found a post", so it is hashed.
+    social_post_found: bool = False
+
+    # Attributable non-social sources (Wikimedia, Wikipedia, Archive.org).
+    # Evidence the image is genuinely public even when no social post
+    # exists. Same shape as all_social_results, minus via_cdn.
+    web_sources: List[Dict[str, Any]] = field(default_factory=list)
+
     # --- metadata, deliberately NOT hashed ---
+    # How the platform was identified. True when it came from a media-CDN
+    # host (e.g. i.ytimg.com) rather than a page URL. This is provenance —
+    # the same class of thing as search_engine — so it is recorded in the
+    # file but kept out of the hash: post_url and platform already carry
+    # the substantive claim, and hashing "how we got there" would make the
+    # same discovery hash differently across engines.
+    platform_via_cdn: bool = False
+    # The CDN image URL the post URL was reconstructed from, when it was.
+    source_cdn_url: str = ""
     discovered_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -141,7 +178,83 @@ class MatchRecord:
             "candidate_image_url": self.candidate_image_url,
             "face_verified": self.face_verified,
             "face_distance": self.face_distance,
+            "all_social_results": self.canonical_social_results(),
+            "social_post_found": bool(self.social_post_found),
+            "web_sources": self.canonical_web_sources(),
         }
+
+    @staticmethod
+    def _canonical_list(items: Any, key_name: str,
+                        include_cdn: bool) -> List[Dict[str, Any]]:
+        """Shared canonicaliser: drop junk, dedupe by URL, sort, cap."""
+        cleaned = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            entry: Dict[str, Any] = {"url": url,
+                                     key_name: item.get(key_name)}
+            if include_cdn:
+                entry["via_cdn"] = bool(item.get("via_cdn", False))
+            cleaned.append(entry)
+
+        seen, unique = set(), []
+        for item in cleaned:
+            if item["url"] in seen:
+                continue
+            seen.add(item["url"])
+            unique.append(item)
+
+        unique.sort(key=lambda d: (str(d[key_name] or ""), d["url"]))
+        return unique[:MAX_SOCIAL_RESULTS]
+
+    def canonical_web_sources(self) -> List[Dict[str, Any]]:
+        """`web_sources` reduced to a stable, hashable form."""
+        return self._canonical_list(self.web_sources, "source", False)
+
+    def canonical_social_results(self) -> List[Dict[str, Any]]:
+        """
+        `all_social_results` reduced to a stable, hashable form.
+
+        Sorted by (platform, url) and trimmed to the three fields that
+        constitute the claim, so the hash does not depend on the order the
+        engine happened to return results in, nor on any extra annotation
+        added later. Capped at MAX_SOCIAL_RESULTS.
+        """
+        cleaned = []
+        for item in self.all_social_results or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            cleaned.append({
+                "url": url,
+                "platform": item.get("platform"),
+                "via_cdn": bool(item.get("via_cdn", False)),
+            })
+
+        # Deduplicate on URL, keeping first occurrence.
+        seen, unique = set(), []
+        for item in cleaned:
+            if item["url"] in seen:
+                continue
+            seen.add(item["url"])
+            unique.append(item)
+
+        unique.sort(key=lambda d: (str(d["platform"] or ""), d["url"]))
+        return unique[:MAX_SOCIAL_RESULTS]
+
+    @property
+    def platforms_found(self) -> List[str]:
+        """Distinct platform names, in stable order — for display."""
+        names = {
+            str(r["platform"]) for r in self.canonical_social_results()
+            if r.get("platform")
+        }
+        return sorted(names)
 
     def content_hash(self) -> str:
         """Hex SHA-256 of the canonical hashed payload."""

@@ -273,3 +273,449 @@ def test_gallery_without_sources_still_loads(tmp_path):
     g = FaceGallery.load(p)
     assert g.sources == []
     assert g.source_for("ref00") is None      # degrades, doesn't crash
+
+
+# ---------------------------------------------------------------------------
+# Media-CDN handling
+#
+# Reverse image search usually returns the CDN URL of the matched image, not
+# the page it appeared on. Before this was handled, genuine social hits were
+# scored as ordinary web noise and thrown away — find_match.py reported "no
+# social media post found" while a real YouTube post sat in the results.
+# ---------------------------------------------------------------------------
+
+from search.social_filter import (  # noqa: E402
+    canonical_url_from_cdn,
+    match_media_cdn,
+)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://i.ytimg.com/vi/uNJO_n_-510/oardefault.jpg", "YouTube"),
+    ("https://i.pinimg.com/originals/2f/82/e9/abc.jpg", "Pinterest"),
+    ("https://scontent.cdninstagram.com/v/t51/123_n.jpg", "Instagram"),
+    ("https://pbs.twimg.com/media/Abc123.jpg", "Twitter/X"),
+    ("https://media.licdn.com/dms/image/C4D/profile.jpg", "LinkedIn"),
+    ("https://preview.redd.it/abc123.jpg", "Reddit"),
+    ("https://live.staticflickr.com/65535/123_abc.jpg", "Flickr"),
+])
+def test_media_cdn_hosts_are_recognised(url, expected):
+    assert match_media_cdn(url) == expected
+
+
+def test_fbcdn_splits_facebook_from_instagram():
+    # fbcdn.net serves both; only Instagram's variants name themselves.
+    assert match_media_cdn("https://scontent.fbom1-1.fna.fbcdn.net/v/x.jpg") \
+        == "Facebook"
+    assert match_media_cdn(
+        "https://instagram.fbom1-1.fna.fbcdn.net/v/x.jpg") == "Instagram"
+
+
+@pytest.mark.parametrize("url", [
+    "https://assets.telegraphindia.com/abp/2025/Jul/salman.jpg",
+    "https://images.news18.com/ibnlive/uploads/2025/10/x.jpg",
+    "https://example.com/photo.jpg",
+    "",
+    "not-a-url",
+])
+def test_non_platform_cdns_are_not_social(url):
+    assert match_media_cdn(url) is None
+
+
+def test_youtube_watch_url_is_recovered_from_thumbnail():
+    url = ("https://i.ytimg.com/vi/uNJO_n_-510/oardefault.jpg"
+           "?sqp=-oaymwEkCJUDENAFSFqQAgHyq4qpAxMIARUAAAAAJQ")
+    assert canonical_url_from_cdn(url) == \
+        "https://www.youtube.com/watch?v=uNJO_n_-510"
+
+
+def test_youtube_webp_thumbnail_also_recovers():
+    assert canonical_url_from_cdn(
+        "https://i.ytimg.com/vi_webp/dQw4w9WgXcQ/hq720.webp") == \
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+@pytest.mark.parametrize("url", [
+    # No post id is recoverable from these — guessing one would be fabrication.
+    "https://i.pinimg.com/originals/2f/82/e9/abc.jpg",
+    "https://scontent.cdninstagram.com/v/t51/123_n.jpg",
+    "https://pbs.twimg.com/media/Abc123.jpg",
+    "https://i.ytimg.com/an_webp/notavalidid/x.webp",   # id wrong length
+    "https://example.com/vi/uNJO_n_-510/x.jpg",         # right shape, wrong host
+])
+def test_no_canonical_url_is_invented(url):
+    assert canonical_url_from_cdn(url) is None
+
+
+def test_the_exact_run_that_reported_no_match_now_finds_the_post():
+    """Regression: these are the four results from the failing run."""
+    raw = [
+        {"url": "https://i.ytimg.com/vi/uNJO_n_-510/oardefault.jpg?sqp=-oaymw",
+         "title": "#happybirthday #salmankhan #fyp - YouTube"},
+        {"url": "https://assets.telegraphindia.com/abp/2025/Jul/salman.jpg",
+         "title": "Payel-Dwipayan Bengali Serial actress"},
+        {"url": "https://i.pinimg.com/originals/2f/82/e9/abc.jpg",
+         "title": "210 Salman Khan in Jacket ideas"},
+        {"url": "https://images.news18.com/ibnlive/uploads/2025/10/x.jpg",
+         "title": "Why A Furious Danny Denzongpa Kept Rejecting Movies"},
+    ]
+    best = best_social_result(raw)
+    assert best is not None, "a real YouTube post was in these results"
+    assert best.platform == "YouTube"
+    assert best.url == "https://www.youtube.com/watch?v=uNJO_n_-510"
+    assert best.via_cdn is True
+    assert best.cdn_url.startswith("https://i.ytimg.com/")
+
+
+def test_recovered_post_outranks_cdn_only_and_news():
+    raw = [
+        {"url": "https://images.news18.com/x.jpg"},
+        {"url": "https://i.pinimg.com/originals/2f/abc.jpg"},
+        {"url": "https://i.ytimg.com/vi/uNJO_n_-510/default.jpg"},
+    ]
+    ranked = rank_results(raw)
+    assert ranked[0].platform == "YouTube"      # recovered post URL wins
+    assert ranked[0].rank_score == 4
+    assert ranked[1].platform == "Pinterest"    # CDN-only, still social
+    assert ranked[1].rank_score == 2
+    assert ranked[2].is_social is False         # news site
+
+
+def test_a_real_page_url_still_outranks_any_cdn_hit():
+    raw = [
+        {"url": "https://i.ytimg.com/vi/uNJO_n_-510/default.jpg"},
+        {"url": "https://www.instagram.com/p/REAL123/"},
+    ]
+    ranked = rank_results(raw)
+    assert ranked[0].url == "https://www.instagram.com/p/REAL123/"
+    assert ranked[0].rank_score == 5
+    assert ranked[0].via_cdn is False
+
+
+def test_cdn_rewrite_does_not_corrupt_plain_results():
+    """A normal social page must pass through completely untouched."""
+    raw = [{"url": "https://twitter.com/someone/status/123",
+            "title": "hello", "engine": "yandex"}]
+    r = rank_results(raw)[0]
+    assert r.url == "https://twitter.com/someone/status/123"
+    assert r.platform == "Twitter/X"
+    assert r.via_cdn is False
+    assert r.cdn_url == ""
+    assert r.title == "hello"
+    assert r.engine == "yandex"
+
+
+def test_cdn_provenance_does_not_change_the_content_hash():
+    """platform_via_cdn is provenance, not a claim — it must stay out of
+    the hash, or the same discovery would anchor differently per engine."""
+    base = _record(post_url="https://www.youtube.com/watch?v=uNJO_n_-510")
+    via_cdn = _record(
+        post_url="https://www.youtube.com/watch?v=uNJO_n_-510",
+        platform_via_cdn=True,
+        source_cdn_url="https://i.ytimg.com/vi/uNJO_n_-510/default.jpg",
+    )
+    assert via_cdn.content_hash() == base.content_hash()
+
+
+def test_changing_the_recovered_post_url_still_breaks_the_hash():
+    """The URL itself is a substantive claim and must remain hashed."""
+    a = _record(post_url="https://www.youtube.com/watch?v=uNJO_n_-510")
+    b = _record(post_url="https://www.youtube.com/watch?v=AAAAAAAAAAA")
+    assert a.content_hash() != b.content_hash()
+
+
+# ---------------------------------------------------------------------------
+# all_social_results — recording every platform, not just the winner
+# ---------------------------------------------------------------------------
+
+def test_all_social_results_is_hashed():
+    """'Found on YouTube and Pinterest' is a stronger claim than 'found on
+    YouTube' — adding a platform must change the hash."""
+    one = _record(all_social_results=[
+        {"url": "https://www.youtube.com/watch?v=uNJO_n_-510",
+         "platform": "YouTube", "via_cdn": True},
+    ])
+    two = _record(all_social_results=[
+        {"url": "https://www.youtube.com/watch?v=uNJO_n_-510",
+         "platform": "YouTube", "via_cdn": True},
+        {"url": "https://www.instagram.com/p/ABC123/",
+         "platform": "Instagram", "via_cdn": False},
+    ])
+    assert one.content_hash() != two.content_hash()
+
+
+def test_social_result_order_does_not_change_the_hash():
+    """Engines return results in arbitrary order; the same finding must
+    hash identically regardless."""
+    a = [{"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+         {"url": "https://www.youtube.com/watch?v=uNJO_n_-510",
+          "platform": "YouTube"}]
+    assert _record(all_social_results=a).content_hash() == \
+        _record(all_social_results=list(reversed(a))).content_hash()
+
+
+def test_duplicate_social_results_are_collapsed():
+    dupes = _record(all_social_results=[
+        {"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+        {"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+    ])
+    once = _record(all_social_results=[
+        {"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+    ])
+    assert len(dupes.canonical_social_results()) == 1
+    assert dupes.content_hash() == once.content_hash()
+
+
+def test_social_results_are_capped():
+    from search.record import MAX_SOCIAL_RESULTS
+    many = _record(all_social_results=[
+        {"url": f"https://www.instagram.com/p/POST{i}/", "platform": "Instagram"}
+        for i in range(MAX_SOCIAL_RESULTS + 20)
+    ])
+    assert len(many.canonical_social_results()) == MAX_SOCIAL_RESULTS
+
+
+def test_malformed_social_entries_are_dropped_not_crashed():
+    r = _record(all_social_results=[
+        {"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+        {"url": "", "platform": "Instagram"},      # no url
+        {"platform": "YouTube"},                   # missing url entirely
+        "not-a-dict",                              # wrong type
+        None,
+    ])
+    cleaned = r.canonical_social_results()
+    assert len(cleaned) == 1
+    assert cleaned[0]["url"] == "https://www.instagram.com/p/A/"
+    r.content_hash()   # must not raise
+
+
+def test_platforms_found_is_deduplicated_and_sorted():
+    r = _record(all_social_results=[
+        {"url": "https://www.youtube.com/watch?v=b", "platform": "YouTube"},
+        {"url": "https://www.instagram.com/p/A/", "platform": "Instagram"},
+        {"url": "https://www.youtube.com/watch?v=a", "platform": "YouTube"},
+        {"url": "https://x.com/a/status/1", "platform": None},
+    ])
+    assert r.platforms_found == ["Instagram", "YouTube"]
+
+
+def test_empty_social_results_round_trip(tmp_path):
+    r = _record()
+    assert r.canonical_social_results() == []
+    assert r.platforms_found == []
+    p = tmp_path / "rec.json"
+    r.save(p)
+    assert MatchRecord.load(p).content_hash() == r.content_hash()
+
+
+def test_social_results_survive_a_save_load_round_trip(tmp_path):
+    r = _record(all_social_results=[
+        {"url": "https://www.youtube.com/watch?v=uNJO_n_-510",
+         "platform": "YouTube", "via_cdn": True},
+        {"url": "https://www.instagram.com/p/ABC123/",
+         "platform": "Instagram", "via_cdn": False},
+    ])
+    p = tmp_path / "rec.json"
+    r.save(p)
+    loaded = MatchRecord.load(p)
+    assert loaded.platforms_found == ["Instagram", "YouTube"]
+    assert loaded.content_hash() == r.content_hash()
+
+
+def test_a_v1_record_still_hashes_as_v1(tmp_path):
+    """Records anchored before this change must keep verifying."""
+    r = _record()
+    r.record_version = "stage2-match-record/v1"
+    p = tmp_path / "old.json"
+    r.save(p)
+    loaded = MatchRecord.load(p)
+    assert loaded.record_version == "stage2-match-record/v1"
+    assert loaded.content_hash() == r.content_hash()
+
+
+# ---------------------------------------------------------------------------
+# Attributable web sources (Wikimedia et al)
+#
+# Reporting "the image isn't indexed on any social platform the engine can
+# see" when Wikimedia had it was false. These are not social media and must
+# never count as such — but they ARE real evidence the image is public.
+# ---------------------------------------------------------------------------
+
+from search.social_filter import (  # noqa: E402
+    canonical_url_from_web_source,
+    match_web_source,
+    unwrap_proxy_url,
+)
+
+WIKI_UPLOAD = ("https://upload.wikimedia.org/wikipedia/commons/a/a4/"
+               "Salman_Khan_snapped_at_the_Angry_Young_Men_trailer_launch.jpg")
+
+
+@pytest.mark.parametrize("url,expected", [
+    (WIKI_UPLOAD, "Wikimedia Commons"),
+    ("https://commons.wikimedia.org/wiki/File:X.jpg", "Wikimedia Commons"),
+    ("https://en.wikipedia.org/wiki/Salman_Khan", "Wikipedia"),
+    ("https://web.archive.org/web/2020/http://x.com", "Internet Archive"),
+])
+def test_web_sources_are_recognised(url, expected):
+    assert match_web_source(url) == expected
+
+
+def test_web_sources_are_never_counted_as_social():
+    """The Stage 2 requirement is a SOCIAL post; a Wikipedia hit must not
+    quietly satisfy it."""
+    r = rank_results([{"url": WIKI_UPLOAD}])[0]
+    assert r.is_social is False
+    assert r.platform is None
+    assert r.is_web_source is True
+    assert r.web_source == "Wikimedia Commons"
+    assert best_social_result([{"url": WIKI_UPLOAD}]) is None
+
+
+def test_wikimedia_upload_resolves_to_the_readable_file_page():
+    assert canonical_url_from_web_source(WIKI_UPLOAD) == (
+        "https://commons.wikimedia.org/wiki/File:"
+        "Salman_Khan_snapped_at_the_Angry_Young_Men_trailer_launch.jpg")
+
+
+def test_wikimedia_thumbnail_resolves_to_the_same_page():
+    thumb = ("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a4/"
+             "Some_File.jpg/800px-Some_File.jpg")
+    assert canonical_url_from_web_source(thumb) == \
+        "https://commons.wikimedia.org/wiki/File:Some_File.jpg"
+
+
+def test_language_wiki_upload_resolves_to_that_wiki():
+    url = "https://upload.wikimedia.org/wikipedia/en/3/3f/Logo.png"
+    assert canonical_url_from_web_source(url) == \
+        "https://en.wikipedia.org/wiki/File:Logo.png"
+
+
+@pytest.mark.parametrize("url", [
+    "https://commons.wikimedia.org/wiki/File:X.jpg",   # already a page
+    "https://example.com/wikipedia/commons/a/a4/X.jpg",
+    "https://upload.wikimedia.org/nonsense",
+])
+def test_no_wiki_page_invented_from_unrecognised_paths(url):
+    assert canonical_url_from_web_source(url) is None
+
+
+def test_wordpress_image_proxy_is_unwrapped():
+    """i0.wp.com is a proxy; the real host is inside the path and is what
+    belongs in the record."""
+    proxied = ("https://i0.wp.com/images.indianexpress.com/2025/06/"
+               "Salman-Khan-2-1.jpg?resize=758%2C758&ssl=1")
+    assert unwrap_proxy_url(proxied) == \
+        "https://images.indianexpress.com/2025/06/Salman-Khan-2-1.jpg"
+
+    r = rank_results([{"url": proxied}])[0]
+    assert r.domain == "images.indianexpress.com"
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/a/b.jpg",
+    "https://i0.wp.com/",
+    "https://i0.wp.com/onlyhost",
+])
+def test_non_proxy_urls_are_left_alone(url):
+    assert unwrap_proxy_url(url) is None
+
+
+def test_social_always_outranks_a_web_source():
+    ranked = rank_results([
+        {"url": WIKI_UPLOAD},
+        {"url": "https://www.instagram.com/p/REAL/"},
+    ])
+    assert ranked[0].is_social and ranked[0].rank_score == 5
+    assert ranked[1].is_web_source and ranked[1].rank_score == 1
+
+
+def test_web_source_outranks_an_ordinary_news_page():
+    ranked = rank_results([
+        {"url": "https://images.news18.com/x.jpg"},
+        {"url": WIKI_UPLOAD},
+    ])
+    assert ranked[0].is_web_source
+    assert ranked[1].rank_score == 0
+
+
+def test_the_wikipedia_run_records_the_finding_instead_of_denying_it():
+    """Regression for the run that claimed the image wasn't indexed
+    anywhere while Wikimedia was holding it."""
+    raw = [
+        {"url": WIKI_UPLOAD, "title": "File:Salman Khan snapped..."},
+        {"url": "https://i0.wp.com/images.indianexpress.com/2025/06/x.jpg?ssl=1",
+         "title": "news"},
+        {"url": "https://s3.crackedcdn.com/phpimages/imageset/6/3/4/1.jpg",
+         "title": "cracked"},
+    ]
+    ranked = rank_results(raw)
+    assert best_social_result(raw) is None, "none of these are social"
+    web = [r for r in ranked if r.is_web_source]
+    assert len(web) == 1
+    assert web[0].web_source == "Wikimedia Commons"
+    assert web[0].url.startswith("https://commons.wikimedia.org/wiki/File:")
+
+
+# --- record-level -----------------------------------------------------------
+
+def test_social_post_found_flag_changes_the_hash():
+    """'We found a post' and 'we found none' must never hash alike."""
+    found = _record(social_post_found=True)
+    not_found = _record(social_post_found=False)
+    assert found.content_hash() != not_found.content_hash()
+
+
+def test_web_sources_are_hashed():
+    a = _record(social_post_found=False)
+    b = _record(social_post_found=False, web_sources=[
+        {"url": "https://commons.wikimedia.org/wiki/File:X.jpg",
+         "source": "Wikimedia Commons"}])
+    assert a.content_hash() != b.content_hash()
+
+
+def test_web_source_order_does_not_change_the_hash():
+    items = [
+        {"url": "https://commons.wikimedia.org/wiki/File:B.jpg",
+         "source": "Wikimedia Commons"},
+        {"url": "https://en.wikipedia.org/wiki/X", "source": "Wikipedia"},
+    ]
+    assert _record(web_sources=items).content_hash() == \
+        _record(web_sources=list(reversed(items))).content_hash()
+
+
+def test_malformed_web_sources_are_dropped_not_crashed():
+    r = _record(web_sources=[
+        {"url": "https://commons.wikimedia.org/wiki/File:X.jpg",
+         "source": "Wikimedia Commons"},
+        {"url": ""}, {}, "nope", None,
+    ])
+    assert len(r.canonical_web_sources()) == 1
+    r.content_hash()
+
+
+def test_a_negative_finding_round_trips_and_verifies(tmp_path):
+    """A 'no social post' record must be anchorable and re-verifiable like
+    any other — that is the point of recording it."""
+    r = _record(
+        post_url="https://commons.wikimedia.org/wiki/File:X.jpg",
+        social_post_found=False,
+        web_sources=[{"url": "https://commons.wikimedia.org/wiki/File:X.jpg",
+                      "source": "Wikimedia Commons"}],
+    )
+    p = tmp_path / "rec.json"
+    r.save(p)
+    loaded = MatchRecord.load(p)
+    assert loaded.social_post_found is False
+    assert loaded.content_hash() == r.content_hash()
+
+
+def test_older_record_versions_still_hash_as_themselves(tmp_path):
+    for version in ("stage2-match-record/v1", "stage2-match-record/v2"):
+        r = _record()
+        r.record_version = version
+        p = tmp_path / f"{version.replace('/', '_')}.json"
+        r.save(p)
+        loaded = MatchRecord.load(p)
+        assert loaded.record_version == version
+        assert loaded.content_hash() == r.content_hash()

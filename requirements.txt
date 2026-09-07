@@ -21,12 +21,27 @@ requests==2.34.2
 # Stage 3: blockchain anchoring & verification
 #
 # web3 talks JSON-RPC to any chain: a local Ganache/Anvil/Hardhat node,
-# or a public testnet (Sepolia, Polygon Amoy).
+# or a public testnet (Sepolia, Polygon Amoy). This is all Stage 3 needs.
 #
-# The [tester] extra adds an in-process EVM (eth-tester + py-evm) so
-# Stage 3 can run with NO node installed at all — used by
-# `anchor_record.py --simulated` and by tests/test_chain.py.
-#
-# No Solidity compiler is needed: contracts/MatchRegistry.json ships
-# precompiled. Only run scripts/compile_contract.py if you edit the .sol.
+# No Solidity compiler is needed either: contracts/MatchRegistry.json
+# ships precompiled. Only run scripts/compile_contract.py if you edit
+# the .sol source.
 web3==8.0.0
+
+# OPTIONAL — in-process EVM (`--simulated` mode + the EVM tests in
+# tests/test_chain.py). Deliberately NOT installed by default:
+#
+#   web3[tester]  ->  eth-tester[py-evm]  ->  py-evm  ->  safe-pysha3
+#
+# safe-pysha3 is a C extension with no prebuilt Windows wheel, so on
+# Windows pip tries to compile it and fails with "Microsoft Visual C++
+# 14.0 or greater is required" — which aborts the ENTIRE install, not
+# just this package.
+#
+# You do not need it. The normal path is a real local node:
+#     npx ganache --wallet.deterministic
+# Without this extra, tests/test_chain.py skips its 15 EVM tests and
+# `--simulated` reports that it is unavailable; everything else works.
+#
+# Install it only if you have MSVC Build Tools (or are on Linux/macOS):
+#     pip install "web3[tester]==8.0.0"

@@ -507,6 +507,35 @@ machine. This is tested directly — see `tests/test_search.py`.
 | 1 | Search failed (no image, browser error, engine blocked) |
 | 2 | Search succeeded but found no social post — a real result, not a bug |
 
+Exit code 2 still **writes a record**. "We searched and found no social
+post" is itself a claim worth making tamper-evident, so Stage 3 can
+anchor it: that proves the search really did come back empty rather than
+being edited afterwards. The record carries `social_post_found: false`
+plus any attributable web sources found.
+
+### Social posts vs. attributable web sources
+
+Results fall into three groups, and the distinction is deliberate:
+
+| Group | Examples | Counts as a social post? |
+|---|---|---|
+| Social platforms | Instagram, YouTube, Reddit, LinkedIn | **Yes** |
+| Attributable web sources | Wikimedia Commons, Wikipedia, Internet Archive | **No** |
+| Everything else | news sites, scrapers, image farms | No |
+
+A Wikimedia Commons file page has an uploader, a date and a licence, so
+it is genuine evidence the image is public — but it is not social media,
+and widening the definition to make a demo pass would defeat the point.
+When only web sources are found, Stage 2 says so explicitly and reports
+where, rather than claiming the image isn't online.
+
+Note that reverse image search returns the **CDN address** of a matched
+image more often than the page address, so `i.ytimg.com` (YouTube),
+`i.pinimg.com` (Pinterest) and `upload.wikimedia.org` are mapped back to
+their platforms, and the real page URL is reconstructed where the link
+genuinely encodes it. See `FIXES.md` for why it is never guessed
+otherwise.
+
 ### Known limitations (Stage 2)
 
 - **Reverse image search finds the photo, not the person.** If the exact
@@ -548,7 +577,15 @@ can go wrong on the day":
 |---|---|---|---|
 | **Local node** (default) | Ganache / Anvil / Hardhat on `localhost:8545` | Node.js | Yes, until you stop it |
 | **Public testnet** | Sepolia or Polygon Amoy | Testnet funds from a faucet | Yes, forever, publicly |
-| **Simulated** | in-process EVM (`eth-tester` + `py-evm`) | nothing | No — dies with the process |
+| **Simulated** | in-process EVM (`eth-tester` + `py-evm`) | the optional `web3[tester]` extra | No — dies with the process |
+
+> **Simulated mode is not installed by default.** `web3[tester]` pulls in
+> `py-evm` → `safe-pysha3`, a C extension with no prebuilt Windows wheel,
+> so on Windows pip tries to compile it and fails with *"Microsoft Visual
+> C++ 14.0 or greater is required"* — aborting the whole install. Plain
+> `web3` is in `requirements.txt` instead. Without the extra,
+> `--simulated` reports that it's unavailable and `tests/test_chain.py`
+> skips its 15 EVM tests; the local-node and testnet paths are unaffected.
 
 All three run **the same compiled contract and the same code path**. The
 demo recording uses a local Ganache node: it is a real EVM executing real
@@ -685,13 +722,24 @@ during development, not just asserted here.
 
 ### What is and isn't in the hash
 
-| In the hash (substantive claims) | Excluded (volatile) |
+| In the hash (substantive claims) | Excluded (volatile / provenance) |
 |---|---|
 | `post_url`, `platform`, `page_title` | `discovered_at` timestamp |
 | `candidate_image_url` | local file paths |
 | `query_image_sha256`, `scan_image_sha256` | result counts |
 | `identified_subject`, `identification_distance` | search engine / mode |
-| `face_verified`, `face_distance` | |
+| `face_verified`, `face_distance` | `platform_via_cdn`, `source_cdn_url` |
+| `all_social_results` (every platform found) | |
+
+`all_social_results` is hashed because "found on YouTube, Instagram and
+Pinterest" is a stronger claim than "found on YouTube" — adding or
+removing a platform must break verification. It is canonicalised first
+(deduplicated, trimmed to `url`/`platform`/`via_cdn`, sorted) so the hash
+doesn't depend on the order the engine returned results in.
+
+`platform_via_cdn` is *not* hashed for the opposite reason: it describes
+how the post was found, not what was found, so the same discovery made
+through Google rather than Yandex must still hash identically.
 
 Volatile fields are excluded so that re-saving the record on another
 machine, at another time, from another folder still verifies. Substantive

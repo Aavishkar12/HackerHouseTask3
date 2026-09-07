@@ -143,7 +143,14 @@ def main() -> int:
         content_hash = record.content_hash()
         print(f"[*] Record  : {record_path}")
         print(f"    subject : {record.identified_subject or 'UNKNOWN'}")
-        print(f"    post    : {record.post_url}")
+        if record.social_post_found:
+            print(f"    post    : {record.post_url}")
+        else:
+            print("    post    : NONE (no social media post was found)")
+            n = len(record.canonical_web_sources())
+            if n:
+                print(f"              image was found on {n} attributable "
+                      "web source(s)")
         print(f"\n[+] Recomputed SHA-256: {content_hash}")
         print("    (recomputed from the file right now — not read from the "
               "anchor receipt)")
