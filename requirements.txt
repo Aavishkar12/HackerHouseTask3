@@ -29,4 +29,4 @@ requests==2.34.2
 #
 # No Solidity compiler is needed: contracts/MatchRegistry.json ships
 # precompiled. Only run scripts/compile_contract.py if you edit the .sol.
-web3[tester]==8.0.0
+web3==8.0.0
